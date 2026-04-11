@@ -1319,21 +1319,30 @@ export class OctoGatewayHandlers {
     //   AND arm_templates are present, expand the user's single-grip
     //   graph into a multi-phase DAG with work + judge + verdict grips.
     let expandedArmTemplatesByGrip: Map<string, import("./schema.js").ArmTemplate[]> | undefined;
+    const expandableModes = new Set([
+      "competitive",
+      "competitive_single_judge",
+      "council",
+      "collaborative",
+      "consensus",
+    ]);
     if (
       spec.arm_templates &&
       spec.arm_templates.length > 1 &&
-      (spec.execution_mode === "competitive" || spec.execution_mode === "competitive_single_judge")
+      spec.execution_mode &&
+      expandableModes.has(spec.execution_mode)
     ) {
       const { expandCompetitiveGraph, expandSingleJudgeGraph } =
         await import("../head/strategies/competitive.js");
+      const { expandCouncilGraph } = await import("../head/strategies/council.js");
+      const { expandCollaborativeGraph } = await import("../head/strategies/collaborative.js");
+      const { expandConsensusGraph } = await import("../head/strategies/consensus.js");
 
       // Expand each grip in the original graph
       const allGraphNodes: Array<{ grip_id: string; depends_on: string[] }> = [];
       expandedArmTemplatesByGrip = new Map();
 
       for (const originalNode of spec.graph) {
-        // Use initial_input from the first arm template as the prompt,
-        // or fall back to the grip_id as a label.
         const prompt = spec.arm_templates[0].initial_input ?? originalNode.grip_id;
         const expandOpts = {
           gripId: originalNode.grip_id,
@@ -1341,10 +1350,26 @@ export class OctoGatewayHandlers {
           armTemplates: spec.arm_templates,
         };
 
-        const expanded =
-          spec.execution_mode === "competitive"
-            ? expandCompetitiveGraph(expandOpts)
-            : expandSingleJudgeGraph(expandOpts);
+        let expanded: Awaited<ReturnType<typeof expandCompetitiveGraph>>;
+        switch (spec.execution_mode) {
+          case "competitive":
+            expanded = expandCompetitiveGraph(expandOpts);
+            break;
+          case "competitive_single_judge":
+            expanded = expandSingleJudgeGraph(expandOpts);
+            break;
+          case "council":
+            expanded = expandCouncilGraph(expandOpts);
+            break;
+          case "collaborative":
+            expanded = expandCollaborativeGraph(expandOpts);
+            break;
+          case "consensus":
+            expanded = expandConsensusGraph(expandOpts);
+            break;
+          default:
+            expanded = expandCompetitiveGraph(expandOpts);
+        }
 
         for (const node of expanded.graph) {
           // Prefix depends_on with any original dependencies
