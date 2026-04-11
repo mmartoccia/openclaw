@@ -37,8 +37,13 @@
 // Boundary discipline (OCTO-DEC-033): only `@sinclair/typebox`, `node:*`
 // builtins, and relative imports inside `src/octo/` are allowed.
 
+import { join } from "node:path";
 import { Value } from "@sinclair/typebox/value";
-import { isAdapterError, type SessionRef as AdapterSessionRef } from "../adapters/base.ts";
+import {
+  isAdapterError,
+  type Adapter,
+  type SessionRef as AdapterSessionRef,
+} from "../adapters/base.ts";
 import type { AdapterType } from "../adapters/base.ts";
 import { CliExecAdapter } from "../adapters/cli-exec.ts";
 import { createAdapter } from "../adapters/factory.ts";
@@ -227,6 +232,8 @@ export interface OctoGatewayHandlerDeps {
   sessionsSpawnBridge?: SessionsSpawnBridge;
   /** Bridge to acpx harness. Required for structured_acp adapter. */
   acpxBridge?: AcpxBridge;
+  /** Remote node configs for distributed arm spawning via SSH+tmux. */
+  remoteNodes?: Map<string, import("../adapters/remote-pty-tmux.ts").RemoteNodeConfig>;
 }
 
 /**
@@ -244,6 +251,9 @@ export class OctoGatewayHandlers {
   private readonly artifactService: ArtifactService | undefined;
   private readonly sessionsSpawnBridge: SessionsSpawnBridge | undefined;
   private readonly acpxBridge: AcpxBridge | undefined;
+  private readonly remoteNodes:
+    | Map<string, import("../adapters/remote-pty-tmux.ts").RemoteNodeConfig>
+    | undefined;
   private readonly nodeId: string;
   private readonly agentId: string;
   private readonly maxArms: number;
@@ -261,6 +271,7 @@ export class OctoGatewayHandlers {
     this.artifactService = deps.artifactService;
     this.sessionsSpawnBridge = deps.sessionsSpawnBridge;
     this.acpxBridge = deps.acpxBridge;
+    this.remoteNodes = deps.remoteNodes;
     this.nodeId = deps.nodeId;
     this.agentId = deps.agentId ?? "default";
     this.maxArms = deps.maxArms ?? 8;
@@ -376,21 +387,30 @@ export class OctoGatewayHandlers {
       }
     }
 
-    // Step 3 — create adapter via factory. Unsupported adapter types
-    // throw AdapterError("not_supported"), which we surface as
-    // HandlerError("invalid_spec").
-    let adapter;
-    try {
-      adapter = createAdapter(spec.adapter_type, {
-        tmuxManager: this.tmuxManager,
-        sessionsSpawnBridge: this.sessionsSpawnBridge,
-        acpxBridge: this.acpxBridge,
+    // Step 3 — create adapter via factory. If the spec targets a remote
+    // node (via labels.target_node), use RemotePtyTmuxAdapter instead of
+    // the local adapter factory.
+    let adapter: Adapter;
+    const targetNode = spec.labels?.target_node;
+    if (targetNode && this.remoteNodes && this.remoteNodes.size > 0) {
+      const { RemotePtyTmuxAdapter } = await import("../adapters/remote-pty-tmux.js");
+      adapter = new RemotePtyTmuxAdapter({
+        remoteNodes: this.remoteNodes,
+        localSentinelDir: join(process.env.TMPDIR ?? "/tmp", "octo-sentinels"),
       });
-    } catch (err) {
-      if (isAdapterError(err) && err.code === "not_supported") {
-        throw new HandlerError("invalid_spec", `octo.arm.spawn: ${err.message}`);
+    } else {
+      try {
+        adapter = createAdapter(spec.adapter_type, {
+          tmuxManager: this.tmuxManager,
+          sessionsSpawnBridge: this.sessionsSpawnBridge,
+          acpxBridge: this.acpxBridge,
+        });
+      } catch (err) {
+        if (isAdapterError(err) && err.code === "not_supported") {
+          throw new HandlerError("invalid_spec", `octo.arm.spawn: ${err.message}`);
+        }
+        throw err;
       }
-      throw err;
     }
 
     // Step 4 — idempotency check.
