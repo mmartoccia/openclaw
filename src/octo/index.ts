@@ -214,6 +214,26 @@ export async function initOctopus(deps: OctopusDeps): Promise<OctopusInstance> {
   // 5. Initialize adapters + Node Agent
   const tmuxManager = new TmuxManager();
 
+  // 5b. Build remote node configs from octo config (if any).
+  const remoteNodes = new Map<
+    string,
+    { host: string; user: string; password?: string; keyPath?: string; sentinelDir?: string }
+  >();
+  const remoteNodesConfig = (config as Record<string, unknown>).remote_nodes as
+    | Array<{ id: string; host: string; user: string; password?: string; key_path?: string }>
+    | undefined;
+  if (remoteNodesConfig) {
+    for (const rn of remoteNodesConfig) {
+      remoteNodes.set(rn.id, {
+        host: rn.host,
+        user: rn.user,
+        password: rn.password,
+        keyPath: rn.key_path,
+      });
+    }
+    logger.info(`remote nodes configured: ${[...remoteNodes.keys()].join(", ")}`);
+  }
+
   const handlerDeps: OctoGatewayHandlerDeps = {
     registry,
     eventLog,
@@ -221,6 +241,7 @@ export async function initOctopus(deps: OctopusDeps): Promise<OctopusInstance> {
     nodeId: deps.nodeId,
     leaseService: leases,
     policyService: policy,
+    remoteNodes: remoteNodes.size > 0 ? remoteNodes : undefined,
   };
   const handlers = new OctoGatewayHandlers(handlerDeps);
 
