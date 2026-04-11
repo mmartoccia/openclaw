@@ -244,6 +244,34 @@ export async function initOctopus(deps: OctopusDeps): Promise<OctopusInstance> {
       `${reconciliationReport.orphan_count} orphans, ${reconciliationReport.missing_count} missing`,
   );
 
+  // 6b. Start scheduler polling loop — calls assignNextGrip() every
+  //     second to match queued grips to idle arms. Continues until
+  //     shutdown() clears the interval.
+  const SCHEDULER_TICK_MS = 1000;
+  const schedulerTimer = setInterval(() => {
+    try {
+      // Drain all eligible assignments in a single tick so a backlog
+      // of queued grips doesn't take N ticks to clear.
+      let assigned = 0;
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const result = scheduler.assignNextGrip();
+        if (!result) {
+          break;
+        }
+        assigned++;
+        logger.info(`scheduler: assigned grip ${result.gripId} to arm ${result.armId}`);
+      }
+      if (assigned > 0) {
+        logger.info(`scheduler: ${assigned} grip(s) assigned this tick`);
+      }
+    } catch (err) {
+      logger.warn("scheduler tick failed", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }, SCHEDULER_TICK_MS);
+
   // 7. Build features descriptor
   const featuresOcto = buildFeaturesOcto({
     enabled: true,
@@ -271,6 +299,7 @@ export async function initOctopus(deps: OctopusDeps): Promise<OctopusInstance> {
   // 9. Shutdown function — drain node-agent work before closing registry
   const shutdown = async (): Promise<void> => {
     logger.info("shutting down Octopus Orchestrator");
+    clearInterval(schedulerTimer);
     nodeAgent.stop();
     closeOctoRegistry(db);
     logger.info("Octopus Orchestrator shut down");

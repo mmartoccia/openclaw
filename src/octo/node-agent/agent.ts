@@ -477,6 +477,169 @@ export class NodeAgent {
         });
       }
 
+      // Phase cascade: after a grip completes, check if any downstream
+      // grips in the mission graph just became eligible (all their
+      // depends_on are completed). If so, and they have arm templates
+      // in the mission spec, spawn arms for them. This drives the
+      // competitive multi-phase pipeline: work → judge → verdict.
+      try {
+        const mission = this.registry.getMission(arm.mission_id);
+        if (mission && mission.spec?.arm_templates && mission.spec.arm_templates.length > 0) {
+          const allGrips = this.registry.listGrips({ mission_id: arm.mission_id });
+          const gripsByRawId = new Map<string, (typeof allGrips)[0]>();
+          for (const g of allGrips) {
+            gripsByRawId.set(g.grip_id, g);
+          }
+
+          for (const graphNode of mission.spec.graph) {
+            const nsGripId = `${arm.mission_id}/${graphNode.grip_id}`;
+            const grip = gripsByRawId.get(nsGripId);
+            if (!grip || grip.status !== "queued") {
+              continue;
+            }
+            if (graphNode.depends_on.length === 0) {
+              continue;
+            }
+
+            // Check if all dependencies are completed
+            const allDepsCompleted = graphNode.depends_on.every((depId) => {
+              const nsDep = `${arm.mission_id}/${depId}`;
+              const dep = gripsByRawId.get(nsDep);
+              return dep && (dep.status === "completed" || dep.status === "archived");
+            });
+
+            if (!allDepsCompleted) {
+              continue;
+            }
+
+            // This grip just became eligible. Look up its arm template
+            // from the persisted _arm_templates_by_grip metadata. This
+            // map was stored by missionCreate from the strategy expander
+            // and contains the correct judge/verdict prompts.
+            const armTemplatesByGrip = (mission.metadata as Record<string, unknown>)
+              ?._arm_templates_by_grip as Record<string, unknown[]> | undefined;
+
+            // Read outputs from completed dependency grips so we can
+            // inject them into the judge prompt via string substitution.
+            const depOutputs: Record<string, string> = {};
+            const os = await import("node:os");
+            const fs = await import("node:fs");
+            const pathMod = await import("node:path");
+            const sentinelDir = pathMod.join(process.env.TMPDIR ?? "/tmp", "octo-sentinels");
+            for (const depId of graphNode.depends_on) {
+              const nsDep = `${arm.mission_id}/${depId}`;
+              const depGrip = gripsByRawId.get(nsDep);
+              if (depGrip?.assigned_arm_id) {
+                const outputFile = pathMod.join(sentinelDir, `${depGrip.assigned_arm_id}.output`);
+                try {
+                  depOutputs[depId] = fs.readFileSync(outputFile, "utf8").trim();
+                } catch {
+                  depOutputs[depId] = "(output not captured)";
+                }
+              }
+            }
+
+            // Resolve templates for this grip
+            const gripTemplates = armTemplatesByGrip?.[graphNode.grip_id] as
+              | Array<{
+                  adapter_type: string;
+                  runtime_name: string;
+                  agent_id: string;
+                  cwd?: string;
+                  runtime_options: unknown;
+                  initial_input?: string;
+                }>
+              | undefined;
+
+            if (!gripTemplates || gripTemplates.length === 0) {
+              // No templates for this grip — skip
+              continue;
+            }
+
+            for (const template of gripTemplates) {
+              // Inject dependency outputs into the prompt so judges
+              // can actually see the work they're reviewing.
+              let prompt = template.initial_input ?? graphNode.grip_id;
+              for (const [depId, output] of Object.entries(depOutputs)) {
+                prompt = prompt.replace(`[Output will be provided from grip: ${depId}]`, output);
+              }
+
+              const armIdempotencyKey = `${mission.mission_id}:${graphNode.grip_id}:${template.runtime_name}:auto`;
+              try {
+                const { OctoGatewayHandlers } = await import("../wire/gateway-handlers.js");
+                const { TmuxManager } = await import("./tmux-manager.js");
+                const { LeaseService } = await import("../head/leases.js");
+                const { PolicyService } = await import("../head/policy.js");
+                const { OctoLogger, consoleLoggerProvider } = await import("../head/logging.js");
+                const { DEFAULT_OCTO_CONFIG } = await import("../config/schema.js");
+
+                const tmuxManager = new TmuxManager();
+                const leaseService = new LeaseService(
+                  (this.registry as never)["db"] ?? null,
+                  this.eventLog,
+                  DEFAULT_OCTO_CONFIG.lease,
+                );
+                const policyLogger = new OctoLogger("octo:policy:cascade", consoleLoggerProvider);
+                const policyService = new PolicyService(
+                  DEFAULT_OCTO_CONFIG.policy,
+                  new Map(),
+                  policyLogger,
+                );
+                const handlers = new OctoGatewayHandlers({
+                  registry: this.registry,
+                  eventLog: this.eventLog,
+                  tmuxManager,
+                  nodeId: os.hostname(),
+                  leaseService,
+                  policyService: policyService as never,
+                });
+
+                await handlers.armSpawn({
+                  idempotency_key: armIdempotencyKey,
+                  spec: {
+                    spec_version: 1,
+                    mission_id: arm.mission_id,
+                    adapter_type: template.adapter_type as
+                      | "pty_tmux"
+                      | "cli_exec"
+                      | "structured_subagent"
+                      | "structured_acp",
+                    runtime_name: template.runtime_name,
+                    agent_id: template.agent_id,
+                    cwd: template.cwd ?? process.cwd(),
+                    runtime_options: template.runtime_options as Record<string, unknown>,
+                    idempotency_key: armIdempotencyKey,
+                    initial_input: prompt,
+                    labels: {
+                      grip: nsGripId,
+                      execution_mode: mission.spec.execution_mode ?? "direct_execute",
+                      phase: "auto-cascade",
+                    },
+                  },
+                });
+
+                this.log("info", "phase cascade: spawned arm for newly eligible grip", {
+                  mission_id: arm.mission_id,
+                  grip_id: nsGripId,
+                  runtime: template.runtime_name,
+                });
+              } catch (spawnErr) {
+                this.log("warn", "phase cascade: failed to spawn arm for eligible grip", {
+                  mission_id: arm.mission_id,
+                  grip_id: nsGripId,
+                  error: spawnErr instanceof Error ? spawnErr.message : String(spawnErr),
+                });
+              }
+            } // end for template
+          }
+        }
+      } catch (err) {
+        this.log("warn", "phase cascade check failed", {
+          arm_id: arm.arm_id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+
       // Mission completion: after a grip completes, check if ALL grips
       // for this mission are now completed. If so, transition the mission
       // from active → completed. This is the final piece of the lifecycle:
@@ -489,14 +652,39 @@ export class NodeAgent {
             allGrips.length > 0 &&
             allGrips.every((g) => g.status === "completed" || g.status === "archived");
           if (allDone) {
+            // Resolve the output artifact — the last grip's arm output.
+            // For competitive missions, this is the verdict grip's output.
+            // For direct_execute, it's the last completed grip's output.
+            let outputArtifactPath: string | undefined;
+            const lastGrip = allGrips[0]; // sorted by created_at DESC
+            if (lastGrip?.assigned_arm_id) {
+              const pathMod = await import("node:path");
+              const fsMod = await import("node:fs");
+              const sentDir = pathMod.join(process.env.TMPDIR ?? "/tmp", "octo-sentinels");
+              const candidatePath = pathMod.join(sentDir, `${lastGrip.assigned_arm_id}.output`);
+              if (fsMod.existsSync(candidatePath)) {
+                outputArtifactPath = candidatePath;
+              }
+            }
+
             const missionNext = applyMissionTransition(
               { state: mission.status, updated_at: mission.updated_at },
               "completed",
               { now, mission_id: mission.mission_id },
             );
+
+            // Store the output artifact path in metadata so downstream
+            // missions/campaigns can find it via mission show.
+            const updatedMetadata = {
+              ...(mission.metadata as Record<string, unknown>),
+              _output_artifact: outputArtifactPath ?? null,
+              _completed_at: new Date(now).toISOString(),
+            };
+
             this.registry.casUpdateMission(mission.mission_id, mission.version, {
               status: missionNext.state,
               updated_at: missionNext.updated_at,
+              metadata: updatedMetadata,
             });
             await this.eventLog.append({
               schema_version: 1,
@@ -507,11 +695,13 @@ export class NodeAgent {
               actor: `node-agent:${this.nodeId}`,
               payload: {
                 grip_count: allGrips.length,
+                output_artifact: outputArtifactPath ?? null,
               },
             });
             this.log("info", "mission completed — all grips done", {
               mission_id: mission.mission_id,
               grip_count: allGrips.length,
+              output_artifact: outputArtifactPath,
             });
           }
         }

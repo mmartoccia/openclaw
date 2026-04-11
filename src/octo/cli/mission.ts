@@ -20,6 +20,7 @@ import type {
   MissionResumeResponse,
   OctoGatewayHandlers,
 } from "../wire/gateway-handlers.ts";
+import type { ArmTemplate, MissionExecutionMode } from "../wire/schema.ts";
 
 // ──────────────────────────────────────────────────────────────────────────
 // Shared types
@@ -46,11 +47,15 @@ export interface MissionCreateOptions extends MissionJsonOption {
   idempotencyKey: string;
   policyProfileRef?: string;
   metadata?: Record<string, unknown>;
+  executionMode?: MissionExecutionMode;
+  armTemplates?: ArmTemplate[];
+  prompt?: string;
 }
 
 export interface MissionCreateResult {
   mission_id: string;
   grip_count: number;
+  arms_spawned?: number;
 }
 
 /** Gather: invoke gateway handler to create a mission. */
@@ -68,9 +73,15 @@ export async function gatherMissionCreate(
       graph,
       ...(opts.policyProfileRef !== undefined ? { policy_profile_ref: opts.policyProfileRef } : {}),
       ...(opts.metadata !== undefined ? { metadata: opts.metadata } : {}),
+      ...(opts.executionMode !== undefined ? { execution_mode: opts.executionMode } : {}),
+      ...(opts.armTemplates !== undefined ? { arm_templates: opts.armTemplates } : {}),
     },
   });
-  return { mission_id: response.mission_id, grip_count: response.grip_count };
+  return {
+    mission_id: response.mission_id,
+    grip_count: response.grip_count,
+    arms_spawned: (response as { arms_spawned?: number }).arms_spawned,
+  };
 }
 
 /** Format: human-readable create result. */
@@ -78,6 +89,9 @@ export function formatMissionCreate(result: MissionCreateResult): string {
   const lines: string[] = [];
   lines.push(`Mission created: ${result.mission_id}`);
   lines.push(`Grips: ${result.grip_count}`);
+  if (result.arms_spawned !== undefined && result.arms_spawned > 0) {
+    lines.push(`Arms spawned: ${result.arms_spawned}`);
+  }
   lines.push("");
   return lines.join("\n");
 }

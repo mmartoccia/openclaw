@@ -99,9 +99,13 @@ export class PtyTmuxAdapter implements Adapter {
     const armId = (spec as Record<string, unknown>)._arm_id as string | undefined;
     const sessionName = rtOpts.tmuxSessionName ?? armSessionName(armId ?? spec.idempotency_key);
 
-    // Build the command string for tmux new-session. If args are provided,
-    // join them space-separated (tmux parses the combined string itself).
-    const cmdParts = [rtOpts.command, ...(rtOpts.args ?? [])];
+    // Build the command string for tmux new-session. Shell-quote each
+    // arg so prompts with spaces, punctuation, etc. survive tmux's
+    // string parsing. Single-quote wrapping with internal single-quote
+    // escaping (' → '\'' ) is the safest POSIX approach.
+    const shellQuote = (s: string): string =>
+      /^[a-zA-Z0-9_./:=@-]+$/.test(s) ? s : `'${s.replace(/'/g, "'\\''")}'`;
+    const cmdParts = [rtOpts.command, ...(rtOpts.args ?? []).map(shellQuote)];
     const userCmd = cmdParts.join(" ");
 
     // Wrap the user command with sentinel file writing so ProcessWatcher
@@ -118,7 +122,10 @@ export class PtyTmuxAdapter implements Adapter {
       const sentinelPath = join(this.sentinelDir, `${armId}.exit`);
       // Sentinel paths are under tmpdir and contain only alphanumeric/dash/dot
       // characters, so direct interpolation is safe.
-      cmd = `${userCmd}; echo $? > ${sentinelPath}`;
+      // Capture stdout to a file via tee so artifacts can be read after
+      // the tmux session closes. Write exit code to sentinel via PIPESTATUS.
+      const outputPath = join(this.sentinelDir, `${armId}.output`);
+      cmd = `${userCmd} 2>&1 | tee ${outputPath}; _ec=\${PIPESTATUS[0]:-$?}; echo $_ec > ${sentinelPath}; exit $_ec`;
     } else {
       cmd = userCmd;
     }
