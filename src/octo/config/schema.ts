@@ -332,6 +332,21 @@ export const OctoConfigSchema = Type.Object(
     classifier: OctoClassifierConfigSchema,
     // habitats is indexed by nodeId (free-form string)
     habitats: Type.Record(Type.String(), OctoHabitatConfigSchema),
+    // Remote nodes for distributed arm spawning via SSH+tmux.
+    remote_nodes: Type.Optional(
+      Type.Array(
+        Type.Object(
+          {
+            id: NonEmptyString,
+            host: NonEmptyString,
+            user: NonEmptyString,
+            password: Type.Optional(Type.String()),
+            key_path: Type.Optional(Type.String()),
+          },
+          { additionalProperties: false },
+        ),
+      ),
+    ),
   },
   { additionalProperties: false },
 );
