@@ -274,10 +274,21 @@ export class NodeAgent {
               }
             }
           } else {
-            // No sentinel, no session — genuinely failed.
-            await this.transitionArm(arm, "failed", "arm.failed", {
-              reason: "session_not_found_on_poll",
-            });
+            // No sentinel yet, session gone. This could be a race:
+            // fast-exiting commands finish before the sentinel wrapper
+            // writes the exit code. Give a grace period of 3 poll ticks
+            // before declaring failure.
+            const graceKey = `sentinel-grace:${arm.arm_id}`;
+            const graceCount = (this as unknown as Record<string, number>)[graceKey] ?? 0;
+            if (graceCount < 3) {
+              (this as unknown as Record<string, number>)[graceKey] = graceCount + 1;
+              // Skip this tick — check again next time.
+            } else {
+              delete (this as unknown as Record<string, number>)[graceKey];
+              await this.transitionArm(arm, "failed", "arm.failed", {
+                reason: "session_not_found_on_poll",
+              });
+            }
           }
         }
       }
