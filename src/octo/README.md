@@ -116,6 +116,116 @@ Explore 3 different approaches to a problem simultaneously. Each arm investigate
 
 Let arms work independently but with guardrails — policy enforcement, approval gates, budget limits, and the ability for a human to attach to any arm at any time and take over.
 
+## Execution Strategies
+
+Missions support multiple execution strategies via the `execution_mode` field. Each strategy defines how arms are spawned, how work is evaluated, and how the final output is selected.
+
+### `direct_execute` (default)
+
+One arm per grip. Simple task execution. No competition, no review.
+
+```bash
+openclaw octo mission create \
+  --title "Add login page" \
+  --grip "login-page" \
+  --arm-template claude-code \
+  --prompt "Create a login page component"
+```
+
+### `competitive` — Round-Robin Peer Review
+
+N models compete on the same task. Each model reviews the other models' outputs. A verdict aggregates all reviews and selects the winner.
+
+**How it works:**
+
+1. **Phase 1 — Work** (parallel): Each model independently solves the task
+2. **Phase 2 — Peer Review** (parallel, auto-triggered): Each model reviews the other N-1 solutions. Claude reviews Codex+Gemini. Codex reviews Claude+Gemini. Gemini reviews Claude+Codex.
+3. **Phase 3 — Verdict** (auto-triggered): Aggregates all peer reviews, selects the winner, updates ELO ratings
+
+```bash
+openclaw octo mission create \
+  --title "Design auth middleware" \
+  --execution-mode competitive \
+  --grip "auth-middleware" \
+  --arm-template claude-code codex gemini \
+  --prompt "Design and implement JWT auth middleware for Express"
+```
+
+This creates 7 grips (3 work + 3 judge + 1 verdict) and auto-spawns 3 arms. The judge and verdict arms spawn automatically when their dependencies complete. A single output artifact persists on the completed mission.
+
+**Graph structure (3 models):**
+
+```
+work:claude-code ─┐
+work:codex ───────┼──▶ judge:claude-code (reviews codex + gemini) ─┐
+work:gemini ──────┘    judge:codex (reviews claude + gemini) ──────┼──▶ verdict
+                       judge:gemini (reviews claude + codex) ──────┘
+```
+
+### `competitive_single_judge` — One Judge Reviews All
+
+Same as competitive but with a single designated judge instead of peer review.
+
+```bash
+openclaw octo mission create \
+  --title "Optimize query" \
+  --execution-mode competitive_single_judge \
+  --grip "query-optimization" \
+  --arm-template claude-code codex gemini \
+  --prompt "Optimize the user search query for 10M+ rows"
+```
+
+Creates 4 grips (3 work + 1 judge). Simpler, faster, but single point of evaluation.
+
+### `council` (planned)
+
+N models each produce input. A synthesizer merges all inputs into a unified output that combines the best ideas from each. No losers — every model's contribution is incorporated.
+
+Best for: complex design decisions, architecture reviews, multi-perspective analysis.
+
+### `collaborative` (planned)
+
+Models work sequentially, building on each other's output. Model A drafts → Model B critiques and improves → Model C refines. Each iteration produces a better artifact.
+
+Best for: iterative refinement, code review chains, progressive enhancement.
+
+### `consensus` (planned)
+
+N models must independently converge on the same answer. If they disagree, the task is re-run with additional context until agreement is reached. Validates correctness through independent reproduction.
+
+Best for: high-stakes decisions, security-critical code, mathematical proofs.
+
+### Composability
+
+Each mission is an atomic composable unit:
+
+- **Input**: prompt text or artifact from a prior mission
+- **Output**: single artifact file, path stored in mission metadata (`_output_artifact`)
+- **Status**: queryable via `openclaw octo mission show <id> --json`
+
+Missions chain by reading the output artifact of one mission as the input to the next. This enables workflows of workflows — campaigns that compose missions the same way missions compose grips.
+
+### Tool Scoping
+
+Arm templates support `tool_scope` to restrict which tools and MCP servers the spawned CLI loads. This keeps memory lean when running multiple arms in parallel:
+
+```json
+{
+  "arm_templates": [
+    {
+      "adapter_type": "pty_tmux",
+      "runtime_name": "claude-code",
+      "agent_id": "main",
+      "runtime_options": { "command": "claude", "args": ["-p"] },
+      "tool_scope": {
+        "tool_allow": ["read", "write", "bash", "grep"],
+        "mcp_deny": ["gpd-*", "grepika"]
+      }
+    }
+  ]
+}
+```
+
 ## Quick Start
 
 ### Enable Octopus
@@ -187,47 +297,48 @@ openclaw octo mission abort <id>      # Abort a mission
 
 ## CLI Reference
 
-| Command                         | Description                                         |
-| ------------------------------- | --------------------------------------------------- |
-| `octo status`                   | Subsystem dashboard — missions, arms, grips, claims |
-| `octo doctor`                   | Health checks (feature flag, storage, tmux, etc.)   |
-| `octo init`                     | Initialize the registry and storage                 |
-| `octo mission create`           | Create a new mission with grips                     |
-| `octo mission list`             | List all missions                                   |
-| `octo mission show <id>`        | Show mission details                                |
-| `octo mission pause <id>`       | Pause a running mission                             |
-| `octo mission resume <id>`      | Resume a paused mission                             |
-| `octo mission abort <id>`       | Abort a mission and terminate its arms              |
-| `octo arm list`                 | List all arms                                       |
-| `octo arm show <id>`            | Show arm details and event history                  |
-| `octo arm spawn`                | Spawn a new arm from an ArmSpec (flags or JSON)     |
-| `octo arm attach <id>`          | Attach to an arm's tmux session (interactive)       |
-| `octo arm terminate <id>`       | Terminate an arm                                    |
-| `octo arm restart <id>`         | Restart a failed arm                                |
-| `octo grip list`                | List all grips                                      |
-| `octo grip show <id>`           | Show grip details                                   |
-| `octo grip reassign <id> <arm>` | Reassign a grip to a different arm                  |
-| `octo claims`                   | List active resource claims                         |
-| `octo events`                   | Tail the event log                                  |
-| `octo runtimes`                 | Discover available agentic tools on this machine    |
-| `octo top`                      | Real-time TUI dashboard                             |
-| `octo node list`                | List cluster nodes                                  |
-| `octo node show <id>`           | Show node details                                   |
+| Command                         | Description                                                         |
+| ------------------------------- | ------------------------------------------------------------------- |
+| `octo status`                   | Subsystem dashboard — missions, arms, grips, claims                 |
+| `octo doctor`                   | Health checks (feature flag, storage, tmux, etc.)                   |
+| `octo init`                     | Initialize the registry and storage                                 |
+| `octo mission create`           | Create a mission (`--execution-mode`, `--arm-template`, `--prompt`) |
+| `octo mission list`             | List all missions                                                   |
+| `octo mission show <id>`        | Show mission details                                                |
+| `octo mission pause <id>`       | Pause a running mission                                             |
+| `octo mission resume <id>`      | Resume a paused mission                                             |
+| `octo mission abort <id>`       | Abort a mission and terminate its arms                              |
+| `octo arm list`                 | List all arms                                                       |
+| `octo arm show <id>`            | Show arm details and event history                                  |
+| `octo arm spawn`                | Spawn a new arm from an ArmSpec (flags or JSON)                     |
+| `octo arm attach <id>`          | Attach to an arm's tmux session (interactive)                       |
+| `octo arm terminate <id>`       | Terminate an arm                                                    |
+| `octo arm restart <id>`         | Restart a failed arm                                                |
+| `octo grip list`                | List all grips                                                      |
+| `octo grip show <id>`           | Show grip details                                                   |
+| `octo grip reassign <id> <arm>` | Reassign a grip to a different arm                                  |
+| `octo claims`                   | List active resource claims                                         |
+| `octo events`                   | Tail the event log                                                  |
+| `octo runtimes`                 | Discover available agentic tools on this machine                    |
+| `octo top`                      | Real-time TUI dashboard                                             |
+| `octo node list`                | List cluster nodes                                                  |
+| `octo node show <id>`           | Show node details                                                   |
 
 All commands support `--json` for machine-readable output.
 
 ## What's Inside
 
-| Layer             | Contents                                                                                                                                                                        | Files         |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------- |
-| **Wire protocol** | Methods, events, features, primitives, TypeBox schemas                                                                                                                          | `wire/`       |
-| **Config**        | `octo:` config block loader, schema, validator                                                                                                                                  | `config/`     |
-| **Head services** | Registry, ArmFSM, GripFSM, MissionFSM, EventLog, Scheduler, Claims, Artifacts, Leases, Policy, Approvals, Quarantine, Retry, GraphEvaluator, GripLifecycle, WorktreeCoordinator | `head/`       |
-| **Node Agent**    | Agent loop, SessionReconciler, TmuxManager, ProcessWatcher, PendingLog, RemoteReconciler, GatewayClient                                                                         | `node-agent/` |
-| **Adapters**      | cli_exec, pty_tmux, structured_subagent, structured_acp + OpenClaw bridge modules                                                                                               | `adapters/`   |
-| **CLI**           | All `openclaw octo` subcommands                                                                                                                                                 | `cli/`        |
-| **Agent tools**   | Tool schemas for in-conversation orchestration                                                                                                                                  | `tools/`      |
-| **Tests**         | 1,436 unit tests, 5 integration tests, 12 chaos tests                                                                                                                           | `test/`       |
+| Layer             | Contents                                                                                                                                                                        | Files              |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
+| **Wire protocol** | Methods, events, features, primitives, TypeBox schemas                                                                                                                          | `wire/`            |
+| **Config**        | `octo:` config block loader, schema, validator                                                                                                                                  | `config/`          |
+| **Head services** | Registry, ArmFSM, GripFSM, MissionFSM, EventLog, Scheduler, Claims, Artifacts, Leases, Policy, Approvals, Quarantine, Retry, GraphEvaluator, GripLifecycle, WorktreeCoordinator | `head/`            |
+| **Strategies**    | Competitive (round-robin peer review), competitive_single_judge, council, collaborative, consensus — graph expanders and judge prompt builders                                  | `head/strategies/` |
+| **Node Agent**    | Agent loop, SessionReconciler, TmuxManager, ProcessWatcher, PendingLog, RemoteReconciler, GatewayClient                                                                         | `node-agent/`      |
+| **Adapters**      | cli_exec, pty_tmux, structured_subagent, structured_acp + OpenClaw bridge modules                                                                                               | `adapters/`        |
+| **CLI**           | All `openclaw octo` subcommands                                                                                                                                                 | `cli/`             |
+| **Agent tools**   | Tool schemas for in-conversation orchestration                                                                                                                                  | `tools/`           |
+| **Tests**         | 1,436 unit tests, 5 integration tests, 12 chaos tests                                                                                                                           | `test/`            |
 
 ## Design Principles
 
