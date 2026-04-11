@@ -80,6 +80,38 @@ async function withHandlers<T>(
     const policyLogger = new OctoLogger("octo:policy:cli", consoleLoggerProvider);
     const policyService = new PolicyService(octoConfig.policy, new Map(), policyLogger);
     const artifactService = new ArtifactService(db, eventLog);
+    // Build remote nodes map. loadOctoConfig may not have remote_nodes
+    // (it depends on how rawConfig is passed), so also try reading
+    // directly from the openclaw.json file.
+    let remoteNodesConfig = (octoConfig as Record<string, unknown>).remote_nodes as
+      | Array<{ id: string; host: string; user: string; password?: string; key_path?: string }>
+      | undefined;
+    if (!remoteNodesConfig) {
+      try {
+        const fs = await import("node:fs");
+        const path = await import("node:path");
+        const configPath = path.join(os.homedir(), ".openclaw", "openclaw.json");
+        const raw = JSON.parse(fs.readFileSync(configPath, "utf8"));
+        remoteNodesConfig = raw?.octo?.remote_nodes;
+      } catch {
+        // Best effort
+      }
+    }
+    let remoteNodes:
+      | Map<string, { host: string; user: string; password?: string; keyPath?: string }>
+      | undefined;
+    if (remoteNodesConfig && remoteNodesConfig.length > 0) {
+      remoteNodes = new Map();
+      for (const rn of remoteNodesConfig) {
+        remoteNodes.set(rn.id, {
+          host: rn.host,
+          user: rn.user,
+          password: rn.password,
+          keyPath: rn.key_path,
+        });
+      }
+    }
+
     const handlers = new OctoGatewayHandlers({
       registry,
       eventLog,
@@ -88,6 +120,7 @@ async function withHandlers<T>(
       leaseService,
       policyService: policyService as never,
       artifactService,
+      remoteNodes,
     });
     return await fn({ db, registry, eventLog, handlers });
   } finally {
@@ -182,6 +215,10 @@ export function registerOctoCli(program: Command) {
       "Arm templates as runtime_name (e.g. claude-code codex gemini) — auto-spawns one arm per template per grip",
     )
     .option("--arm-cwd <cwd>", "Working directory for auto-spawned arms", process.cwd())
+    .option(
+      "--target-node <nodes...>",
+      "Map runtime to remote node (e.g. codex=distiller-rpi5 gemini=distiller-rpi5). Unmapped runtimes run locally.",
+    )
     .option("--prompt <text>", "Task prompt passed to each spawned CLI as initial_input")
     .option("--json", "Output as JSON")
     .action(async (opts) => {
@@ -227,16 +264,36 @@ export function registerOctoCli(program: Command) {
       // ProcessWatcher (sentinel files, tmux session monitoring, arm
       // state transitions). cli_exec spawns child processes but has no
       // completion callback to the arm state machine.
+      // Parse --target-node mappings: "codex=distiller-rpi5" → { codex: "distiller-rpi5" }
+      const nodeMap = new Map<string, string>();
+      if (opts.targetNode) {
+        for (const mapping of opts.targetNode as string[]) {
+          const [runtime, node] = mapping.split("=");
+          if (runtime && node) {
+            nodeMap.set(runtime, node);
+          }
+        }
+      }
+
       let armTemplates: import("../wire/schema.js").ArmTemplate[] | undefined;
       if (opts.armTemplate && opts.armTemplate.length > 0) {
         armTemplates = opts.armTemplate.map((name: string) => {
           const profile = runtimeProfiles[name];
+          const targetNode = nodeMap.get(name);
+          // When targeting a remote node, use /tmp as default cwd
+          // since the local cwd won't exist on the remote machine.
+          const effectiveCwd = targetNode
+            ? opts.armCwd !== process.cwd()
+              ? opts.armCwd
+              : "/tmp"
+            : (opts.armCwd ?? process.cwd());
           const base = {
             adapter_type: "pty_tmux" as const,
             runtime_name: name,
             agent_id: opts.owner ?? "main",
-            cwd: opts.armCwd ?? process.cwd(),
+            cwd: effectiveCwd,
             ...(opts.prompt ? { initial_input: opts.prompt } : {}),
+            ...(targetNode ? { labels: { target_node: targetNode } } : {}),
           };
           if (profile) {
             return {
