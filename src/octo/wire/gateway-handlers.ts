@@ -174,6 +174,7 @@ export interface LeaseRenewResult {
 export interface MissionCreateResponse {
   mission_id: string;
   grip_count: number;
+  arms_spawned?: number;
 }
 
 export interface MissionPauseResponse {
@@ -717,6 +718,75 @@ export class OctoGatewayHandlers {
       }
     }
 
+    // Step 12b — cli_exec deferred exit handler. For still-alive
+    //   cli_exec processes, register an onExit callback so the arm
+    //   state machine transitions when the process eventually exits.
+    //   This closes the gap where the NodeAgent poll loop skips
+    //   non-pty_tmux arms.
+    if (adapter instanceof CliExecAdapter && adapterRef.session_id) {
+      const adapterHealth = await adapter.health(adapterRef);
+      if (adapterHealth === "alive") {
+        const capturedArmId = arm_id;
+        const capturedSessionId = adapterRef.session_id;
+        adapter.onExit(capturedSessionId, async (exitCode) => {
+          try {
+            const targetState = exitCode === 0 ? "completed" : "failed";
+            const now = this.now();
+            let currentArm = this.registry.getArm(capturedArmId);
+            if (!currentArm) {
+              return;
+            }
+
+            // Drive starting → active if needed.
+            if (currentArm.state === "starting") {
+              const active = applyArmTransition(
+                { state: currentArm.state, updated_at: currentArm.updated_at },
+                "active",
+                { now, arm_id: capturedArmId },
+              );
+              currentArm = this.registry.casUpdateArm(capturedArmId, currentArm.version, {
+                state: active.state,
+                updated_at: active.updated_at,
+              });
+              await this.eventLog.append({
+                schema_version: 1,
+                entity_type: "arm",
+                entity_id: capturedArmId,
+                event_type: "arm.active",
+                ts: new Date(now).toISOString(),
+                actor: `node-agent:${this.nodeId}`,
+                payload: {},
+              });
+            }
+
+            // Drive active → completed/failed.
+            if (currentArm.state === "active") {
+              const next = applyArmTransition(
+                { state: currentArm.state, updated_at: currentArm.updated_at },
+                targetState,
+                { now, arm_id: capturedArmId },
+              );
+              this.registry.casUpdateArm(capturedArmId, currentArm.version, {
+                state: next.state,
+                updated_at: next.updated_at,
+              });
+              await this.eventLog.append({
+                schema_version: 1,
+                entity_type: "arm",
+                entity_id: capturedArmId,
+                event_type: targetState === "completed" ? "arm.completed" : "arm.failed",
+                ts: new Date(now).toISOString(),
+                actor: `node-agent:${this.nodeId}`,
+                payload: { exit_code: exitCode, adapter_type: "cli_exec" },
+              });
+            }
+          } catch {
+            // Best-effort — log errors shouldn't crash the gateway.
+          }
+        });
+      }
+    }
+
     // Step 13 — return.
     return { arm_id, session_ref };
   }
@@ -1244,11 +1314,71 @@ export class OctoGatewayHandlers {
       return { mission_id: existingMission.mission_id, grip_count: gripCount };
     }
 
+    // Step 4b -- competitive strategy graph expansion.
+    //   When execution_mode is competitive or competitive_single_judge
+    //   AND arm_templates are present, expand the user's single-grip
+    //   graph into a multi-phase DAG with work + judge + verdict grips.
+    let expandedArmTemplatesByGrip: Map<string, import("./schema.js").ArmTemplate[]> | undefined;
+    if (
+      spec.arm_templates &&
+      spec.arm_templates.length > 1 &&
+      (spec.execution_mode === "competitive" || spec.execution_mode === "competitive_single_judge")
+    ) {
+      const { expandCompetitiveGraph, expandSingleJudgeGraph } =
+        await import("../head/strategies/competitive.js");
+
+      // Expand each grip in the original graph
+      const allGraphNodes: Array<{ grip_id: string; depends_on: string[] }> = [];
+      expandedArmTemplatesByGrip = new Map();
+
+      for (const originalNode of spec.graph) {
+        // Use initial_input from the first arm template as the prompt,
+        // or fall back to the grip_id as a label.
+        const prompt = spec.arm_templates[0].initial_input ?? originalNode.grip_id;
+        const expandOpts = {
+          gripId: originalNode.grip_id,
+          prompt,
+          armTemplates: spec.arm_templates,
+        };
+
+        const expanded =
+          spec.execution_mode === "competitive"
+            ? expandCompetitiveGraph(expandOpts)
+            : expandSingleJudgeGraph(expandOpts);
+
+        for (const node of expanded.graph) {
+          // Prefix depends_on with any original dependencies
+          const deps = [...originalNode.depends_on.map((d) => `${d}:verdict`), ...node.depends_on];
+          allGraphNodes.push({ grip_id: node.grip_id, depends_on: deps });
+        }
+        for (const [gripId, templates] of expanded.armTemplatesByGrip) {
+          expandedArmTemplatesByGrip.set(gripId, templates);
+        }
+      }
+
+      // Replace the spec's graph with the expanded graph
+      (spec as { graph: typeof allGraphNodes }).graph = allGraphNodes;
+    }
+
     // Step 5 -- generate mission_id.
     const mission_id = this.generateMissionId();
     const created_at = this.now();
 
     // Step 6 -- insert MissionRecord.
+    // Persist the expanded arm templates map so the NodeAgent's phase
+    // cascade can spawn judge/verdict arms with the correct prompts.
+    const metadata: Record<string, unknown> = {
+      ...spec.metadata,
+      _idempotency_key: idempotencyKey,
+    };
+    if (expandedArmTemplatesByGrip) {
+      const serialized: Record<string, unknown[]> = {};
+      for (const [gripId, templates] of expandedArmTemplatesByGrip) {
+        serialized[gripId] = templates;
+      }
+      metadata._arm_templates_by_grip = serialized;
+    }
+
     const missionInput: MissionInput = {
       mission_id,
       title: spec.title,
@@ -1256,7 +1386,7 @@ export class OctoGatewayHandlers {
       status: "active",
       policy_profile_ref: spec.policy_profile_ref ?? null,
       spec,
-      metadata: { ...spec.metadata, _idempotency_key: idempotencyKey },
+      metadata,
       created_at,
     };
     this.registry.putMission(missionInput);
@@ -1299,6 +1429,86 @@ export class OctoGatewayHandlers {
       this.registry.putGrip(gripInput);
     }
 
+    // Step 7b -- auto-spawn arms from arm_templates.
+    //   For competitive modes with expanded graphs, use per-grip
+    //   templates and only spawn arms for Phase 1 grips (no deps).
+    //   For direct_execute, spawn all arm_templates for all grips.
+    let armsSpawned = 0;
+    const useExpandedTemplates = expandedArmTemplatesByGrip !== undefined;
+    if ((spec.arm_templates && spec.arm_templates.length > 0) || useExpandedTemplates) {
+      for (const node of spec.graph) {
+        // For competitive modes, only auto-spawn arms for grips with
+        // no dependencies (Phase 1 work grips). Judge/verdict grips
+        // will be spawned by the scheduler when their deps complete.
+        if (useExpandedTemplates && node.depends_on.length > 0) {
+          continue;
+        }
+        const namespacedGripId = `${mission_id}/${node.grip_id}`;
+        const templatesForGrip = useExpandedTemplates
+          ? (expandedArmTemplatesByGrip!.get(node.grip_id) ?? [])
+          : (spec.arm_templates ?? []);
+        for (const template of templatesForGrip) {
+          const armIdempotencyKey = `${idempotencyKey}:${node.grip_id}:${template.runtime_name}`;
+          try {
+            // Build env with tool scoping when declared on the template.
+            const armEnv: Record<string, string> = {};
+            if (template.tool_scope) {
+              if (template.tool_scope.tool_allow) {
+                armEnv.OPENCLAW_TOOL_ALLOW = template.tool_scope.tool_allow.join(",");
+              }
+              if (template.tool_scope.tool_deny) {
+                armEnv.OPENCLAW_TOOL_DENY = template.tool_scope.tool_deny.join(",");
+              }
+              if (template.tool_scope.mcp_allow) {
+                armEnv.OPENCLAW_MCP_ALLOW = template.tool_scope.mcp_allow.join(",");
+              }
+              if (template.tool_scope.mcp_deny) {
+                armEnv.OPENCLAW_MCP_DENY = template.tool_scope.mcp_deny.join(",");
+              }
+            }
+            await this.armSpawn({
+              idempotency_key: armIdempotencyKey,
+              spec: {
+                spec_version: 1,
+                mission_id,
+                adapter_type: template.adapter_type,
+                runtime_name: template.runtime_name,
+                agent_id: template.agent_id,
+                cwd: template.cwd ?? process.cwd(),
+                runtime_options: template.runtime_options,
+                idempotency_key: armIdempotencyKey,
+                ...(template.initial_input ? { initial_input: template.initial_input } : {}),
+                ...(Object.keys(armEnv).length > 0 ? { env: armEnv } : {}),
+                labels: {
+                  ...template.labels,
+                  grip: namespacedGripId,
+                  execution_mode: spec.execution_mode ?? "direct_execute",
+                },
+              },
+            });
+            armsSpawned++;
+          } catch (err) {
+            // Log but don't fail the mission — partial arm creation
+            // is recoverable; the operator can spawn missing arms.
+            await this.eventLog.append({
+              schema_version: 1,
+              entity_type: "arm",
+              entity_id: `auto-spawn:${template.runtime_name}`,
+              event_type: "arm.failed",
+              ts: new Date(this.now()).toISOString(),
+              actor: `node-agent:${this.nodeId}`,
+              payload: {
+                mission_id,
+                grip_id: namespacedGripId,
+                runtime_name: template.runtime_name,
+                error: err instanceof Error ? err.message : String(err),
+              },
+            });
+          }
+        }
+      }
+    }
+
     // Step 8 -- emit mission.created event.
     await this.eventLog.append({
       schema_version: 1,
@@ -1311,12 +1521,13 @@ export class OctoGatewayHandlers {
         title: spec.title,
         owner: spec.owner,
         grip_count: spec.graph.length,
+        arms_spawned: armsSpawned,
         idempotency_key: idempotencyKey,
       },
     });
 
     // Step 9 -- return.
-    return { mission_id, grip_count: spec.graph.length };
+    return { mission_id, grip_count: spec.graph.length, arms_spawned: armsSpawned };
   }
 
   /**
