@@ -49,6 +49,7 @@ import { CliExecAdapter } from "../adapters/cli-exec.ts";
 import { createAdapter } from "../adapters/factory.ts";
 import type { AcpxBridge } from "../adapters/openclaw/acpx-bridge.ts";
 import type { SessionsSpawnBridge } from "../adapters/openclaw/sessions-spawn.ts";
+import { RemotePtyTmuxAdapter } from "../adapters/remote-pty-tmux.ts";
 import { applyArmTransition, type ArmState } from "../head/arm-fsm.ts";
 import type { ArtifactService } from "../head/artifacts.ts";
 import type { EventLogService } from "../head/event-log.ts";
@@ -392,8 +393,15 @@ export class OctoGatewayHandlers {
     // the local adapter factory.
     let adapter: Adapter;
     const targetNode = spec.labels?.target_node;
+    // eslint-disable-next-line no-console
+    if (targetNode) {
+      console.info(
+        `[octo] armSpawn: target_node=${targetNode}, remoteNodes=${this.remoteNodes?.size ?? "undefined"}`,
+      );
+    }
     if (targetNode && this.remoteNodes && this.remoteNodes.size > 0) {
-      const { RemotePtyTmuxAdapter } = await import("../adapters/remote-pty-tmux.js");
+      // eslint-disable-next-line no-console
+      console.info(`[octo] Using RemotePtyTmuxAdapter for node=${targetNode}`);
       adapter = new RemotePtyTmuxAdapter({
         remoteNodes: this.remoteNodes,
         localSentinelDir: join(process.env.TMPDIR ?? "/tmp", "octo-sentinels"),
