@@ -255,6 +255,8 @@ export class OctoGatewayHandlers {
   private readonly remoteNodes:
     | Map<string, import("../adapters/remote-pty-tmux.ts").RemoteNodeConfig>
     | undefined;
+  /** Singleton remote adapter kept alive so SSH pollers don't get GC'd. */
+  private remoteAdapter: RemotePtyTmuxAdapter | undefined;
   private readonly nodeId: string;
   private readonly agentId: string;
   private readonly maxArms: number;
@@ -402,10 +404,14 @@ export class OctoGatewayHandlers {
     if (targetNode && this.remoteNodes && this.remoteNodes.size > 0) {
       // eslint-disable-next-line no-console
       console.info(`[octo] Using RemotePtyTmuxAdapter for node=${targetNode}`);
-      adapter = new RemotePtyTmuxAdapter({
-        remoteNodes: this.remoteNodes,
-        localSentinelDir: join(process.env.TMPDIR ?? "/tmp", "octo-sentinels"),
-      });
+      // Reuse singleton so SSH pollers survive across armSpawn calls.
+      if (!this.remoteAdapter) {
+        this.remoteAdapter = new RemotePtyTmuxAdapter({
+          remoteNodes: this.remoteNodes,
+          localSentinelDir: join(process.env.TMPDIR ?? "/tmp", "octo-sentinels"),
+        });
+      }
+      adapter = this.remoteAdapter;
     } else {
       try {
         adapter = createAdapter(spec.adapter_type, {

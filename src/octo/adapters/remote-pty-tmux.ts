@@ -134,14 +134,29 @@ export class RemotePtyTmuxAdapter implements Adapter {
     const cmdParts = [rtOpts.command, ...(rtOpts.args ?? []).map(shellQuote)];
     const userCmd = cmdParts.join(" ");
 
-    // Wrap with sentinel + output capture
-    const wrappedCmd = `${userCmd} 2>&1 | tee ${remoteOutputPath}; _ec=\\$\\{PIPESTATUS[0]:-\\$?\\}; echo \\$_ec > ${remoteSentinelPath}; exit \\$_ec`;
+    // Write a wrapper script on the remote to avoid SSH+tmux quoting hell.
+    // The script runs the user command, captures output via tee, writes
+    // the exit code to a sentinel file, then exits with the original code.
+    const remoteScriptPath = `${remoteSentinelDir}/${armId}.sh`;
+    const scriptContent = [
+      "#!/bin/bash",
+      `cd ${shellQuote(spec.cwd)}`,
+      `${userCmd} 2>&1 | tee ${remoteOutputPath}`,
+      "_ec=${PIPESTATUS[0]:-$?}",
+      `echo $_ec > ${remoteSentinelPath}`,
+      "exit $_ec",
+    ].join("\n");
 
-    // Create sentinel dir on remote
+    // Create sentinel dir and write the script on remote
     await sshExec(node, `mkdir -p ${remoteSentinelDir}`);
+    // Use heredoc to write script without quoting issues
+    await sshExec(
+      node,
+      `cat > ${remoteScriptPath} << 'OCTO_SCRIPT_EOF'\n${scriptContent}\nOCTO_SCRIPT_EOF\nchmod +x ${remoteScriptPath}`,
+    );
 
-    // Start tmux session on remote
-    const tmuxCmd = `tmux new-session -d -s ${sessionName} -c ${shellQuote(spec.cwd)} '${wrappedCmd}'`;
+    // Start tmux session on remote running the script
+    const tmuxCmd = `tmux new-session -d -s ${sessionName} ${remoteScriptPath}`;
     try {
       await sshExec(node, tmuxCmd);
     } catch (err) {
