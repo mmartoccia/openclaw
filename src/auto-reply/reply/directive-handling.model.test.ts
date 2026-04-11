@@ -300,6 +300,8 @@ describe("/model chat UX", () => {
       sessionEntry: {
         modelProvider: "deepinfra",
         model: "moonshotai/Kimi-K2.5",
+        sessionId: "test-session",
+        updatedAt: Date.now(),
       },
     });
 
