@@ -318,8 +318,8 @@ export async function startGatewayServer(
         baseMethods.push(...octoInstance.methodNames);
         log.info("octopus: initialized successfully");
       } catch (err) {
-        log.error(`octopus: failed to initialize: ${String(err)}`);
-        throw err;
+        log.warn(`octopus: failed to initialize, continuing without octo: ${String(err)}`);
+        octoInstance = null;
       }
     }
   }
