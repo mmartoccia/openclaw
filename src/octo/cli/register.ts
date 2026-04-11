@@ -173,9 +173,87 @@ export function registerOctoCli(program: Command) {
     .option("--grip <grips...>", "Grip IDs to include")
     .option("--idempotency-key <key>", "Idempotency key")
     .option("--policy-profile <ref>", "Policy profile reference")
+    .option(
+      "--execution-mode <mode>",
+      "Execution strategy (direct_execute, competitive, council, collaborative, consensus)",
+    )
+    .option(
+      "--arm-template <templates...>",
+      "Arm templates as runtime_name (e.g. claude-code codex gemini) — auto-spawns one arm per template per grip",
+    )
+    .option("--arm-cwd <cwd>", "Working directory for auto-spawned arms", process.cwd())
+    .option("--prompt <text>", "Task prompt passed to each spawned CLI as initial_input")
     .option("--json", "Output as JSON")
     .action(async (opts) => {
       const { runMissionCreate } = await import("./mission.js");
+
+      // Parse --arm-template shorthand into ArmTemplate objects.
+      // Each known runtime expands to a cli_exec template with the
+      // correct binary, non-interactive flags, and auto-approve flags
+      // so the spawned CLI runs headlessly without confirmation prompts.
+      // Runtime profiles define how each CLI is invoked non-interactively.
+      // buildArgs(prompt) returns the full args array with the prompt
+      // in the correct position for each CLI's argument syntax.
+      interface RuntimeProfile {
+        command: string;
+        buildArgs: (prompt?: string) => string[];
+      }
+      const runtimeProfiles: Record<string, RuntimeProfile> = {
+        "claude-code": {
+          command: "claude",
+          // claude -p "prompt" --dangerously-skip-permissions
+          buildArgs: (p) => ["-p", ...(p ? [p] : []), "--dangerously-skip-permissions"],
+        },
+        claude: {
+          command: "claude",
+          buildArgs: (p) => ["-p", ...(p ? [p] : []), "--dangerously-skip-permissions"],
+        },
+        codex: {
+          command: "codex",
+          // codex exec --full-auto "prompt"
+          buildArgs: (p) => ["exec", "--full-auto", ...(p ? [p] : [])],
+        },
+        gemini: {
+          command: "gemini",
+          // gemini -p "prompt" --approval-mode yolo
+          buildArgs: (p) => [...(p ? ["-p", p] : []), "--approval-mode", "yolo"],
+        },
+        aider: {
+          command: "aider",
+          buildArgs: (p) => ["--yes", ...(p ? ["--message", p] : [])],
+        },
+      };
+      // Use pty_tmux adapter — it has the full lifecycle wired through
+      // ProcessWatcher (sentinel files, tmux session monitoring, arm
+      // state transitions). cli_exec spawns child processes but has no
+      // completion callback to the arm state machine.
+      let armTemplates: import("../wire/schema.js").ArmTemplate[] | undefined;
+      if (opts.armTemplate && opts.armTemplate.length > 0) {
+        armTemplates = opts.armTemplate.map((name: string) => {
+          const profile = runtimeProfiles[name];
+          const base = {
+            adapter_type: "pty_tmux" as const,
+            runtime_name: name,
+            agent_id: opts.owner ?? "main",
+            cwd: opts.armCwd ?? process.cwd(),
+            ...(opts.prompt ? { initial_input: opts.prompt } : {}),
+          };
+          if (profile) {
+            return {
+              ...base,
+              runtime_options: {
+                command: profile.command,
+                args: profile.buildArgs(opts.prompt),
+              },
+            };
+          }
+          return {
+            ...base,
+            runtime_options: { command: name },
+          };
+        });
+      }
+
       const code = await withHandlers(({ handlers }) =>
         runMissionCreate(handlers, {
           title: opts.title,
@@ -183,6 +261,8 @@ export function registerOctoCli(program: Command) {
           gripIds: opts.grip ?? [],
           idempotencyKey: opts.idempotencyKey ?? `cli-${Date.now()}`,
           policyProfileRef: opts.policyProfile,
+          executionMode: opts.executionMode,
+          armTemplates,
           json: opts.json,
         }),
       );

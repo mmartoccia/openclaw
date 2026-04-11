@@ -490,6 +490,12 @@ export const MissionExecutionModeSchema = Type.Union([
   Type.Literal("research_then_design_then_execute"),
   Type.Literal("compare_implementations"),
   Type.Literal("validate_prior_art_then_execute"),
+  // Multi-model orchestration strategies
+  Type.Literal("competitive"),
+  Type.Literal("competitive_single_judge"),
+  Type.Literal("council"),
+  Type.Literal("collaborative"),
+  Type.Literal("consensus"),
 ]);
 export type MissionExecutionMode = Static<typeof MissionExecutionModeSchema>;
 
@@ -514,6 +520,46 @@ export type MissionExecutionMode = Static<typeof MissionExecutionModeSchema>;
 const MISSION_METADATA_MAX_KEYS = 50;
 const MISSION_GRAPH_MAX_NODES = 1024;
 const MISSION_LABELS_MAX_KEYS = 50;
+const MISSION_ARM_TEMPLATES_MAX = 10;
+
+// ArmTemplate — declares an arm to auto-spawn per grip when the
+// mission is created. Used by competitive/council/collaborative/consensus
+// modes to fan out work across multiple model providers.
+// ToolScope — restricts which tools and MCP servers a spawned CLI
+// process loads. Keeps memory lean when running parallel arms.
+// allow takes precedence: if tool_allow is set, only those tools load.
+// deny is subtractive: if tool_deny is set, those tools are excluded.
+// mcp_allow / mcp_deny follow the same logic for MCP servers.
+export const ToolScopeSchema = Type.Object(
+  {
+    tool_allow: Type.Optional(Type.Array(Type.String())),
+    tool_deny: Type.Optional(Type.Array(Type.String())),
+    mcp_allow: Type.Optional(Type.Array(Type.String())),
+    mcp_deny: Type.Optional(Type.Array(Type.String())),
+  },
+  { additionalProperties: false },
+);
+export type ToolScope = Static<typeof ToolScopeSchema>;
+
+export const ArmTemplateSchema = Type.Object(
+  {
+    adapter_type: AdapterTypeSchema,
+    runtime_name: NonEmptyString,
+    agent_id: NonEmptyString,
+    cwd: Type.Optional(NonEmptyString),
+    runtime_options: RuntimeOptionsSchema,
+    labels: Type.Optional(Type.Record(Type.String(), Type.String())),
+    // Task prompt — passed as initial_input to each spawned arm.
+    // For cli_exec, this becomes the prompt argument to the CLI.
+    initial_input: Type.Optional(Type.String()),
+    // Tool scoping — restrict tools/MCPs loaded by the spawned process
+    // to keep memory lean in parallel execution. When omitted, the
+    // CLI loads its full default tool set.
+    tool_scope: Type.Optional(ToolScopeSchema),
+  },
+  { additionalProperties: false },
+);
+export type ArmTemplate = Static<typeof ArmTemplateSchema>;
 
 export const MissionSpecSchema = Type.Object(
   {
@@ -535,6 +581,15 @@ export const MissionSpecSchema = Type.Object(
     labels: Type.Optional(
       Type.Record(Type.String(), Type.String(), {
         maxProperties: MISSION_LABELS_MAX_KEYS,
+      }),
+    ),
+    // Auto-spawn arm templates — when present, missionCreate spawns
+    // one arm per template per grip. Required for competitive/council/
+    // collaborative/consensus modes; optional for direct_execute.
+    arm_templates: Type.Optional(
+      Type.Array(ArmTemplateSchema, {
+        minItems: 1,
+        maxItems: MISSION_ARM_TEMPLATES_MAX,
       }),
     ),
   },
