@@ -262,6 +262,17 @@ export function registerOctoCli(program: Command) {
           command: "aider",
           buildArgs: (p) => ["--yes", ...(p ? ["--message", p] : [])],
         },
+        // openclaw runtime — runs one agent turn through the gateway using
+        // the `main` agent. The tee'd stdout captures the model's reply as
+        // plain text, so Octo's artifact promotion can treat it uniformly
+        // with codex/gemini/etc. Historical bug: the previous fallback
+        // path created `{command: "openclaw"}` with no args, which just
+        // printed `openclaw --help` and captured the help banner as output.
+        // See the 2026-04-12 teleconference transcript for the diagnosis.
+        openclaw: {
+          command: "openclaw",
+          buildArgs: (p) => ["agent", "--agent", "main", ...(p ? ["--message", p] : [])],
+        },
       };
       // Use pty_tmux adapter — it has the full lifecycle wired through
       // ProcessWatcher (sentinel files, tmux session monitoring, arm
@@ -307,10 +318,16 @@ export function registerOctoCli(program: Command) {
               },
             };
           }
-          return {
-            ...base,
-            runtime_options: { command: name },
-          };
+          // Refuse silent fallback. The old behavior created a runtime
+          // template with `{command: name}` and no args, which caused
+          // e.g. `openclaw` to spawn without arguments and capture
+          // `openclaw --help` as its output (see the collaborative
+          // chain bug diagnosed 2026-04-12). Better to fail loud.
+          const knownProfiles = Object.keys(runtimeProfiles).join(", ");
+          throw new Error(
+            `Unknown runtime '${name}'. Known runtimes: ${knownProfiles}. ` +
+              `Add a RuntimeProfile entry in src/octo/cli/register.ts to register new runtimes.`,
+          );
         });
       }
 

@@ -15,6 +15,7 @@
 
 import type { ArmTemplate } from "../../wire/schema.ts";
 import type { ExpandedGraph, GraphNode, CompetitiveExpandOptions } from "./competitive.ts";
+import { rewriteArgsForPrompt } from "./rewrite-prompt.ts";
 
 // ──────────────────────────────────────────────────────────────────────────
 // Synthesizer prompt builder
@@ -66,16 +67,23 @@ export function expandCouncilGraph(opts: CompetitiveExpandOptions): ExpandedGrap
   const graph: GraphNode[] = [];
   const armTemplatesByGrip = new Map<string, ArmTemplate[]>();
 
-  // Phase 1: work grips (one per arm template)
+  // Phase 1: work grips (one per arm template). Each runs the original
+  // task directly — no framing needed for phase 1 because there's
+  // nothing to review yet.
   const workGripIds: string[] = [];
   for (const tmpl of armTemplates) {
     const workId = `${gripId}:work:${tmpl.runtime_name}`;
     workGripIds.push(workId);
     graph.push({ grip_id: workId, depends_on: [] });
+    // runtime_options.args already contain `prompt`; keep them as-is.
     armTemplatesByGrip.set(workId, [{ ...tmpl, initial_input: prompt }]);
   }
 
-  // Phase 2: synthesizer grip
+  // Phase 2: synthesizer grip. Framed prompt contains placeholders
+  // for each contributor output. Rewrite args so the synthesizer CLI
+  // invocation carries the framed prompt; cascade handler will
+  // resolve the `[Output will be provided from grip: X]` placeholders
+  // at spawn time.
   const synthId = `${gripId}:synthesize`;
   graph.push({ grip_id: synthId, depends_on: [...workGripIds] });
 
@@ -84,8 +92,16 @@ export function expandCouncilGraph(opts: CompetitiveExpandOptions): ExpandedGrap
     gripId: `${gripId}:work:${t.runtime_name}`,
   }));
   const synthPrompt = buildSynthesizerPrompt(prompt, contributors);
+  const synthRuntimeOptions =
+    rewriteArgsForPrompt(synthBase.runtime_options, prompt, synthPrompt) ??
+    synthBase.runtime_options;
   armTemplatesByGrip.set(synthId, [
-    { ...synthBase, runtime_name: "synthesizer", initial_input: synthPrompt },
+    {
+      ...synthBase,
+      runtime_name: "synthesizer",
+      initial_input: synthPrompt,
+      runtime_options: synthRuntimeOptions,
+    },
   ]);
 
   return { graph, armTemplatesByGrip };
