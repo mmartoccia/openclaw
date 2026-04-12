@@ -45,18 +45,37 @@ export interface DoctorOptions {
 // ──────────────────────────────────────────────────────────────────────────
 
 function checkFeatureFlag(): DoctorCheck {
-  try {
-    const config = loadOctoConfig({}, { logger: () => {} });
-    return {
-      name: "feature-flag",
-      severity: "ok",
-      message: `octo enabled=${config.enabled}`,
-    };
-  } catch {
+  // Read the real openclaw.json from disk. The CLI process does NOT
+  // share the gateway's in-memory config, so passing `{}` here would
+  // just echo the schema default (`enabled: false`) regardless of what
+  // the operator set. Historical bug: see docs/octopus-orchestrator/
+  // PRESSURE-TEST.md "doctor stale-flag" note from 2026-04-12.
+  const configPath = path.join(homedir(), ".openclaw", "openclaw.json");
+  if (!existsSync(configPath)) {
     return {
       name: "feature-flag",
       severity: "warning",
-      message: "octo config not found, defaulting to disabled",
+      message: "openclaw.json not found, octo defaulting to disabled",
+      detail: `expected at ${configPath}`,
+    };
+  }
+  try {
+    const raw = JSON.parse(readFileSync(configPath, "utf8")) as Record<string, unknown>;
+    const config = loadOctoConfig(raw, { logger: () => {} });
+    // When octo is disabled, surface as a warning so operators see it
+    // loud and clear — reporting disabled-as-OK was a UX trap.
+    return {
+      name: "feature-flag",
+      severity: config.enabled ? "ok" : "warning",
+      message: `octo enabled=${config.enabled}`,
+      ...(config.enabled ? {} : { detail: `set octo.enabled=true in ${configPath}` }),
+    };
+  } catch (err) {
+    return {
+      name: "feature-flag",
+      severity: "warning",
+      message: "openclaw.json failed to parse, octo defaulting to disabled",
+      detail: err instanceof Error ? err.message : String(err),
     };
   }
 }
