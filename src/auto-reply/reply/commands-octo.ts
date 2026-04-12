@@ -5,16 +5,19 @@
 // populates that registry inside initOctopus() during startup; this handler
 // reads it per-request and returns early if octo is disabled / failed init.
 //
-// Supported actions (read-only by default):
-//   status                          — dashboard snapshot
-//   mission list | mission show <id>
-//   arm list | arm show <id>
-//   grip list | grip show <id>
-//   doctor                          — quick health check
+// Supported actions:
+//   Read-only:
+//     status, mission list/show, arm list/show, grip list/show, elo, doctor
+//   Mutating (require `--yes` suffix to confirm):
+//     mission abort <id> --yes
+//     arm terminate <id> --yes
 //
-// Mutating actions (mission create / abort / pause / resume, arm spawn /
-// terminate) stay on the `openclaw octo ...` CLI for now; the chat surface
-// is intentionally read-biased until we have an approval gate in place.
+// Approval gate: mutating actions are a two-step confirm. Without --yes,
+// the handler prints a preview of what would happen and refuses. With
+// --yes, it goes through. This is the simplest single-turn gate that
+// doesn't require threading an ApprovalRequest state machine through the
+// reply pipeline. Mission-create stays on the CLI — too many parameters
+// to make a clean one-liner in chat.
 
 import { logVerbose } from "../../globals.js";
 import { getOctoRuntimeInstance } from "../../octo/runtime-registry.js";
@@ -27,19 +30,35 @@ const HELP_TEXT = [
   "Usage: /octo <action> [args]",
   "",
   "Read-only actions:",
-  "  status                    Dashboard snapshot",
-  "  mission list              List all missions",
-  "  mission show <id>         Show mission detail",
-  "  arm list                  List all arms",
-  "  arm show <id>             Show arm detail",
-  "  grip list                 List all grips",
-  "  grip show <id>            Show grip detail",
-  "  elo                       Runtime Elo rating table",
-  "  doctor                    Quick health check",
+  "  status                        Dashboard snapshot",
+  "  mission list                  List all missions",
+  "  mission show <id>             Show mission detail",
+  "  arm list                      List all arms",
+  "  arm show <id>                 Show arm detail",
+  "  grip list                     List all grips",
+  "  grip show <id>                Show grip detail",
+  "  elo                           Runtime Elo rating table",
+  "  doctor                        Quick health check",
   "",
-  "Mutating actions (create/abort/spawn/terminate) remain on the CLI:",
+  "Mutating actions (require --yes to confirm):",
+  "  mission abort <id> --yes      Abort a running mission",
+  "  mission pause <id> --yes      Pause mission execution",
+  "  mission resume <id> --yes     Resume a paused mission",
+  "  arm terminate <id> --yes      Terminate a single arm",
+  "",
+  "Mission creation stays on the CLI (too many params for chat):",
   "  openclaw octo mission create ...",
 ].join("\n");
+
+const YES_TOKEN = "--yes";
+
+function hasYesFlag(args: string[]): boolean {
+  return args.includes(YES_TOKEN);
+}
+
+function stripYesFlag(args: string[]): string[] {
+  return args.filter((a) => a !== YES_TOKEN);
+}
 
 function stopWithText(text: string): CommandHandlerResult {
   return { shouldContinue: false, reply: { text } };
@@ -162,7 +181,56 @@ export const handleOctoCommand: CommandHandler = async (params, allowTextCommand
           }
           return stopWithText(fenceBlock(truncate(JSON.stringify(mission, null, 2))));
         }
-        return stopWithText("Usage: /octo mission list | /octo mission show <id>");
+        if (subaction === "abort" || subaction === "pause" || subaction === "resume") {
+          const confirmed = hasYesFlag(args);
+          const stripped = stripYesFlag(args);
+          if (stripped.length === 0) {
+            return stopWithText(`Usage: /octo mission ${subaction} <mission_id> --yes`);
+          }
+          const missionId = stripped[0];
+          const mission = octo.services.registry.getMission(missionId);
+          if (!mission) {
+            return stopWithText(`mission not found: ${missionId}`);
+          }
+          if (!confirmed) {
+            const arms = octo.services.registry.listArms({ mission_id: missionId });
+            const live = arms.filter((a) => a.state === "starting" || a.state === "active").length;
+            return stopWithText(
+              `About to ${subaction} mission ${missionId}:\n` +
+                `  title:  ${mission.title}\n` +
+                `  status: ${mission.status}\n` +
+                `  arms:   ${arms.length} total, ${live} live\n\n` +
+                `Re-run with --yes to confirm:\n` +
+                `  /octo mission ${subaction} ${missionId} --yes`,
+            );
+          }
+          const idempotencyKey = `chat-${subaction}-${missionId}-${Date.now()}`;
+          if (subaction === "abort") {
+            const res = await octo.services.handlers.missionAbort({
+              idempotency_key: idempotencyKey,
+              mission_id: missionId,
+              reason: `chat: /octo mission abort by ${params.command.senderId ?? "operator"}`,
+            });
+            return stopWithText(
+              `Mission ${res.mission_id} aborted. Arms terminated: ${res.arms_terminated}`,
+            );
+          }
+          if (subaction === "pause") {
+            const res = await octo.services.handlers.missionPause({
+              idempotency_key: idempotencyKey,
+              mission_id: missionId,
+            });
+            return stopWithText(`Mission ${res.mission_id} paused.`);
+          }
+          const res = await octo.services.handlers.missionResume({
+            idempotency_key: idempotencyKey,
+            mission_id: missionId,
+          });
+          return stopWithText(`Mission ${res.mission_id} resumed.`);
+        }
+        return stopWithText(
+          "Usage: /octo mission list | show <id> | abort <id> --yes | pause <id> --yes | resume <id> --yes",
+        );
       }
 
       case "arm": {
@@ -186,7 +254,38 @@ export const handleOctoCommand: CommandHandler = async (params, allowTextCommand
           }
           return stopWithText(fenceBlock(truncate(JSON.stringify(arm, null, 2))));
         }
-        return stopWithText("Usage: /octo arm list | /octo arm show <id>");
+        if (subaction === "terminate") {
+          const confirmed = hasYesFlag(args);
+          const stripped = stripYesFlag(args);
+          if (stripped.length === 0) {
+            return stopWithText("Usage: /octo arm terminate <arm_id> --yes");
+          }
+          const armId = stripped[0];
+          const arm = octo.services.registry.getArm(armId);
+          if (!arm) {
+            return stopWithText(`arm not found: ${armId}`);
+          }
+          if (!confirmed) {
+            return stopWithText(
+              `About to terminate arm ${armId}:\n` +
+                `  mission: ${arm.mission_id}\n` +
+                `  agent:   ${arm.agent_id}\n` +
+                `  state:   ${arm.state}\n` +
+                `  adapter: ${arm.adapter_type}\n\n` +
+                `Re-run with --yes to confirm:\n` +
+                `  /octo arm terminate ${armId} --yes`,
+            );
+          }
+          const res = await octo.services.handlers.armTerminate({
+            idempotency_key: `chat-terminate-${armId}-${Date.now()}`,
+            arm_id: armId,
+            reason: `chat: /octo arm terminate by ${params.command.senderId ?? "operator"}`,
+          });
+          return stopWithText(
+            `Arm ${res.arm_id} terminated=${res.terminated} final=${res.final_status}.`,
+          );
+        }
+        return stopWithText("Usage: /octo arm list | show <id> | terminate <id> --yes");
       }
 
       case "grip": {

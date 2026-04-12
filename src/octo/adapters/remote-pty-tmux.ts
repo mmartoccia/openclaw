@@ -145,9 +145,25 @@ export class RemotePtyTmuxAdapter implements Adapter {
     // Write a wrapper script on the remote to avoid SSH+tmux quoting hell.
     // The script runs the user command, captures output via tee, writes
     // the exit code to a sentinel file, then exits with the original code.
+    //
+    // PATH handling: SSH non-login shells don't source .zshrc/.bash_profile,
+    // so CLIs installed outside /usr/bin (node via nvm, claude in
+    // ~/.local/bin, codex/gemini via homebrew) aren't findable. We
+    // prepend common install dirs so the wrapper works on both
+    // Linux/RPi (/usr/local/bin) and macOS (~/.local/bin,
+    // /opt/homebrew/bin). Remote-specific overrides can still live in
+    // spec.env.
     const remoteScriptPath = `${remoteSentinelDir}/${armId}.sh`;
+    const envExports: string[] = [];
+    if (spec.env) {
+      for (const [k, v] of Object.entries(spec.env)) {
+        envExports.push(`export ${k}=${shellQuote(v)}`);
+      }
+    }
     const scriptContent = [
       "#!/bin/bash",
+      'export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"',
+      ...envExports,
       `cd ${shellQuote(spec.cwd)}`,
       `${userCmd} 2>&1 | tee ${remoteOutputPath}`,
       "_ec=${PIPESTATUS[0]:-$?}",
