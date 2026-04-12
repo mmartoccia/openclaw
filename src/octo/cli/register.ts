@@ -247,8 +247,11 @@ export function registerOctoCli(program: Command) {
         },
         codex: {
           command: "codex",
-          // codex exec --full-auto "prompt"
-          buildArgs: (p) => ["exec", "--full-auto", ...(p ? [p] : [])],
+          // codex exec --full-auto --skip-git-repo-check "prompt"
+          // --skip-git-repo-check is required when running outside a
+          // trusted git repo (common on /tmp working dirs and remote
+          // nodes like the RPi5 that don't have the project cloned).
+          buildArgs: (p) => ["exec", "--full-auto", "--skip-git-repo-check", ...(p ? [p] : [])],
         },
         gemini: {
           command: "gemini",
