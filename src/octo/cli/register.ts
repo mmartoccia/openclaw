@@ -235,28 +235,61 @@ export function registerOctoCli(program: Command) {
         command: string;
         buildArgs: (prompt?: string) => string[];
       }
+      // Pin minimum model versions for each runtime per the
+      // 2026-04-12 working session: Claude → Sonnet 4.6, Codex →
+      // gpt-5.4, Gemini → gemini-2.5-pro. Operators can override
+      // per-runtime via OCTO_<RUNTIME>_MODEL env vars when they want
+      // to A/B against a different model for the same runtime profile.
+      const claudeModel = process.env.OCTO_CLAUDE_MODEL ?? "claude-sonnet-4-6";
+      const codexModel = process.env.OCTO_CODEX_MODEL ?? "gpt-5.4";
+      const geminiModel = process.env.OCTO_GEMINI_MODEL ?? "gemini-2.5-pro";
       const runtimeProfiles: Record<string, RuntimeProfile> = {
         "claude-code": {
           command: "claude",
-          // claude -p "prompt" --dangerously-skip-permissions
-          buildArgs: (p) => ["-p", ...(p ? [p] : []), "--dangerously-skip-permissions"],
+          // claude --model <id> -p "prompt" --dangerously-skip-permissions
+          buildArgs: (p) => [
+            "--model",
+            claudeModel,
+            "-p",
+            ...(p ? [p] : []),
+            "--dangerously-skip-permissions",
+          ],
         },
         claude: {
           command: "claude",
-          buildArgs: (p) => ["-p", ...(p ? [p] : []), "--dangerously-skip-permissions"],
+          buildArgs: (p) => [
+            "--model",
+            claudeModel,
+            "-p",
+            ...(p ? [p] : []),
+            "--dangerously-skip-permissions",
+          ],
         },
         codex: {
           command: "codex",
-          // codex exec --full-auto --skip-git-repo-check "prompt"
-          // --skip-git-repo-check is required when running outside a
+          // codex exec --model <id> --full-auto --skip-git-repo-check "prompt"
+          // --skip-git-repo-check required when running outside a
           // trusted git repo (common on /tmp working dirs and remote
           // nodes like the RPi5 that don't have the project cloned).
-          buildArgs: (p) => ["exec", "--full-auto", "--skip-git-repo-check", ...(p ? [p] : [])],
+          buildArgs: (p) => [
+            "exec",
+            "--model",
+            codexModel,
+            "--full-auto",
+            "--skip-git-repo-check",
+            ...(p ? [p] : []),
+          ],
         },
         gemini: {
           command: "gemini",
-          // gemini -p "prompt" --approval-mode yolo
-          buildArgs: (p) => [...(p ? ["-p", p] : []), "--approval-mode", "yolo"],
+          // gemini --model <id> -p "prompt" --approval-mode yolo
+          buildArgs: (p) => [
+            "--model",
+            geminiModel,
+            ...(p ? ["-p", p] : []),
+            "--approval-mode",
+            "yolo",
+          ],
         },
         aider: {
           command: "aider",
