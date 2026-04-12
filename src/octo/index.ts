@@ -37,6 +37,7 @@ import { DEFAULT_OCTO_CONFIG, type OctoConfig } from "./config/schema.ts";
 import { ApprovalService } from "./head/approvals.ts";
 import { ArtifactService } from "./head/artifacts.ts";
 import { ClaimService } from "./head/claims.ts";
+import { EloService } from "./head/elo.ts";
 import { EventLogService } from "./head/event-log.ts";
 import { GraphEvaluator } from "./head/graph-evaluator.ts";
 import { GripLifecycleService } from "./head/grip-lifecycle.ts";
@@ -53,6 +54,7 @@ import { NodeAgent } from "./node-agent/agent.ts";
 // createAdapter and EventNormalizer are available for advanced consumers
 // but not wired directly in initOctopus (the handlers use them internally)
 import { TmuxManager } from "./node-agent/tmux-manager.ts";
+import { setOctoRuntimeInstance } from "./runtime-registry.ts";
 import { OCTO_TOOL_SCHEMA_REGISTRY, OCTO_TOOL_NAMES } from "./tools/schemas.ts";
 import { OCTO_PUSH_EVENT_NAMES } from "./wire/events.ts";
 import { buildFeaturesOcto, DEFAULT_FEATURES_OCTO_CAPABILITIES } from "./wire/features.ts";
@@ -136,6 +138,7 @@ export interface OctopusInstance {
     nodeAgent: NodeAgent;
     metrics: OctoMetrics;
     logger: OctoLogger;
+    elo: EloService;
   };
 }
 
@@ -210,6 +213,7 @@ export async function initOctopus(deps: OctopusDeps): Promise<OctopusInstance> {
   const retry = new RetryService(config.retryPolicyDefault);
   const graphEvaluator = new GraphEvaluator(registry, eventLog);
   const gripLifecycle = new GripLifecycleService(registry, eventLog);
+  const elo = new EloService(db);
 
   // 5. Initialize adapters + Node Agent
   const tmuxManager = new TmuxManager();
@@ -217,10 +221,24 @@ export async function initOctopus(deps: OctopusDeps): Promise<OctopusInstance> {
   // 5b. Build remote node configs from octo config (if any).
   const remoteNodes = new Map<
     string,
-    { host: string; user: string; password?: string; keyPath?: string; sentinelDir?: string }
+    {
+      host: string;
+      user: string;
+      password?: string;
+      keyPath?: string;
+      sentinelDir?: string;
+      maxConcurrentArms?: number;
+    }
   >();
   const remoteNodesConfig = (config as Record<string, unknown>).remote_nodes as
-    | Array<{ id: string; host: string; user: string; password?: string; key_path?: string }>
+    | Array<{
+        id: string;
+        host: string;
+        user: string;
+        password?: string;
+        key_path?: string;
+        max_concurrent_arms?: number;
+      }>
     | undefined;
   if (remoteNodesConfig) {
     for (const rn of remoteNodesConfig) {
@@ -229,6 +247,7 @@ export async function initOctopus(deps: OctopusDeps): Promise<OctopusInstance> {
         user: rn.user,
         password: rn.password,
         keyPath: rn.key_path,
+        maxConcurrentArms: rn.max_concurrent_arms,
       });
     }
     logger.info(`remote nodes configured: ${[...remoteNodes.keys()].join(", ")}`);
@@ -253,6 +272,7 @@ export async function initOctopus(deps: OctopusDeps): Promise<OctopusInstance> {
     tmuxManager,
     pollIntervalMs: 1000,
     remoteNodes: remoteNodes.size > 0 ? remoteNodes : undefined,
+    elo,
   });
   let reconciliationReport;
   try {
@@ -323,13 +343,14 @@ export async function initOctopus(deps: OctopusDeps): Promise<OctopusInstance> {
     logger.info("shutting down Octopus Orchestrator");
     clearInterval(schedulerTimer);
     nodeAgent.stop();
+    setOctoRuntimeInstance(null);
     closeOctoRegistry(db);
     logger.info("Octopus Orchestrator shut down");
   };
 
   logger.info("Octopus Orchestrator initialized successfully");
 
-  return {
+  const instance: OctopusInstance = {
     config,
     methodNames: [...OCTO_METHOD_NAMES],
     pushEventNames: [...OCTO_PUSH_EVENT_NAMES],
@@ -355,8 +376,12 @@ export async function initOctopus(deps: OctopusDeps): Promise<OctopusInstance> {
       nodeAgent,
       metrics,
       logger,
+      elo,
     },
   };
+
+  setOctoRuntimeInstance(instance);
+  return instance;
 }
 
 // Re-export key types for consumers

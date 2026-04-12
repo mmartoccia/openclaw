@@ -18,9 +18,12 @@
 //   4. Clean shutdown: stop() clears the polling interval, stops
 //      ProcessWatcher. Does NOT terminate tmux sessions.
 
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { applyArmTransition, InvalidTransitionError } from "../head/arm-fsm.ts";
+import { classifyFailure } from "../head/classify-failure.ts";
+import { parseVerdictForElo, type EloService } from "../head/elo.ts";
 import type { EventLogService } from "../head/event-log.ts";
 import type { AppendInput } from "../head/event-log.ts";
 import { applyGripTransition } from "../head/grip-fsm.ts";
@@ -56,6 +59,9 @@ export interface NodeAgentOptions {
   now?: () => number;
   /** Remote node configs for distributed arm polling. */
   remoteNodes?: Map<string, RemoteNodeConfig>;
+  /** Optional Elo service: when present, competitive mission verdicts
+   *  are parsed on mission completion and ratings are updated. */
+  elo?: EloService;
   logger?: (entry: {
     level: "info" | "warn" | "error";
     message: string;
@@ -85,6 +91,7 @@ export class NodeAgent {
   private readonly logger: NodeAgentOptions["logger"];
 
   private readonly remoteNodes: Map<string, RemoteNodeConfig>;
+  private readonly elo: EloService | undefined;
 
   private pollHandle: ReturnType<typeof setInterval> | null = null;
   private running = false;
@@ -109,6 +116,7 @@ export class NodeAgent {
       );
     this.nowFn = opts.now ?? (() => Date.now());
     this.remoteNodes = opts.remoteNodes ?? new Map();
+    this.elo = opts.elo;
     this.logger = opts.logger;
 
     this.processWatcher = new ProcessWatcher({
@@ -144,9 +152,15 @@ export class NodeAgent {
     // Reconcile on startup.
     const report = await this.reconciler.reconcile();
 
-    // Watch all starting/active arms for this node.
+    // Watch all starting/active arms for this node. Skip remote arms
+    // (target_node label set) — those have no local tmux session, and
+    // ProcessWatcher would fail them with `session_terminated_no_sentinel`
+    // on the first tick. Remote liveness is handled by pollTick step 4.
     const arms = this.registry.listArms({ node_id: this.nodeId });
     for (const arm of arms) {
+      if (arm.spec?.labels?.target_node) {
+        continue;
+      }
       if (arm.state === "starting" || arm.state === "active") {
         this.watchArm(arm);
       }
@@ -180,9 +194,13 @@ export class NodeAgent {
   async reconcile(): Promise<ReconciliationReport> {
     const report = await this.reconciler.reconcile();
 
-    // Watch any newly-discovered starting/active arms.
+    // Watch any newly-discovered starting/active arms. Same remote skip
+    // rule as start(): remote arms are handled by pollTick step 4.
     const arms = this.registry.listArms({ node_id: this.nodeId });
     for (const arm of arms) {
+      if (arm.spec?.labels?.target_node) {
+        continue;
+      }
       if (arm.state === "starting" || arm.state === "active") {
         this.watchArm(arm);
       }
@@ -283,9 +301,10 @@ export class NodeAgent {
             if (activated) {
               const updatedArm = this.registry.getArm(arm.arm_id);
               if (updatedArm) {
+                const classified = this.classifyArmFailure(arm.arm_id);
                 await this.transitionArm(updatedArm, "failed", "arm.failed", {
                   exit_code: exitCode,
-                  reason: `exit_code_${exitCode}`,
+                  reason: classified ?? `exit_code_${exitCode}`,
                 });
               }
             }
@@ -314,8 +333,17 @@ export class NodeAgent {
         const remoteArms = startingArms.filter(
           (arm) => arm.adapter_type === "pty_tmux" && arm.spec?.labels?.target_node,
         );
+        if (remoteArms.length > 0) {
+          this.log("info", "pollTick step4: polling remote arms", {
+            remote_arm_count: remoteArms.length,
+            remote_nodes: [...this.remoteNodes.keys()],
+          });
+        }
         for (const arm of remoteArms) {
-          const targetNodeId = arm.spec.labels.target_node;
+          const targetNodeId = arm.spec.labels?.target_node;
+          if (!targetNodeId) {
+            continue;
+          }
           const nodeConfig = this.remoteNodes.get(targetNodeId);
           if (!nodeConfig) {
             continue;
@@ -385,6 +413,8 @@ export class NodeAgent {
               if (activated) {
                 const updatedArm = this.registry.getArm(arm.arm_id);
                 if (updatedArm) {
+                  const classified =
+                    targetState === "failed" ? this.classifyArmFailure(arm.arm_id) : null;
                   await this.transitionArm(
                     updatedArm,
                     targetState,
@@ -392,6 +422,7 @@ export class NodeAgent {
                     {
                       exit_code: exitCode,
                       remote_node: targetNodeId,
+                      ...(classified ? { reason: classified } : {}),
                     },
                   );
                 }
@@ -787,15 +818,50 @@ export class NodeAgent {
             // Resolve the output artifact — the last grip's arm output.
             // For competitive missions, this is the verdict grip's output.
             // For direct_execute, it's the last completed grip's output.
+            //
+            // Persist every completed arm's output into the durable
+            // artifacts tree at ~/.openclaw/octo/artifacts/<mission>/ so
+            // the outputs survive reboot (macOS wipes $TMPDIR). The
+            // returned _output_artifact path points at the durable copy.
+            const sentDir = path.join(process.env.TMPDIR ?? "/tmp", "octo-sentinels");
+            const stateDir =
+              process.env.OPENCLAW_STATE_DIR?.trim() || path.join(os.homedir(), ".openclaw");
+            const missionArtifactDir = path.join(stateDir, "octo", "artifacts", mission.mission_id);
+            try {
+              mkdirSync(missionArtifactDir, { recursive: true });
+            } catch (err) {
+              this.log("warn", "failed to create mission artifact dir", {
+                mission_id: mission.mission_id,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
+
             let outputArtifactPath: string | undefined;
-            const lastGrip = allGrips[0]; // sorted by created_at DESC
-            if (lastGrip?.assigned_arm_id) {
-              const pathMod = await import("node:path");
-              const fsMod = await import("node:fs");
-              const sentDir = pathMod.join(process.env.TMPDIR ?? "/tmp", "octo-sentinels");
-              const candidatePath = pathMod.join(sentDir, `${lastGrip.assigned_arm_id}.output`);
-              if (fsMod.existsSync(candidatePath)) {
-                outputArtifactPath = candidatePath;
+            for (const grip of allGrips) {
+              if (!grip.assigned_arm_id) {
+                continue;
+              }
+              const srcPath = path.join(sentDir, `${grip.assigned_arm_id}.output`);
+              if (!existsSync(srcPath)) {
+                continue;
+              }
+              const dstPath = path.join(
+                missionArtifactDir,
+                `${grip.grip_id}-${grip.assigned_arm_id}.txt`,
+              );
+              try {
+                copyFileSync(srcPath, dstPath);
+                // The last grip (sorted DESC → allGrips[0]) is the
+                // mission's canonical output.
+                if (grip === allGrips[0]) {
+                  outputArtifactPath = dstPath;
+                }
+              } catch (err) {
+                this.log("warn", "failed to copy arm output to artifacts dir", {
+                  arm_id: grip.assigned_arm_id,
+                  grip_id: grip.grip_id,
+                  error: err instanceof Error ? err.message : String(err),
+                });
               }
             }
 
@@ -835,6 +901,34 @@ export class NodeAgent {
               grip_count: allGrips.length,
               output_artifact: outputArtifactPath,
             });
+
+            // Elo update: if this is a competitive mission (has a
+            // :verdict or :judge grip whose output parses as a verdict
+            // JSON), record a game against the runtime ratings table.
+            if (this.elo && outputArtifactPath) {
+              try {
+                const verdictText = readFileSync(outputArtifactPath, "utf8");
+                const results = parseVerdictForElo(verdictText);
+                if (results && results.length >= 2) {
+                  const game = this.elo.recordGame({
+                    game_id: `game-${mission.mission_id}`,
+                    mission_id: mission.mission_id,
+                    grip_id: allGrips[0].grip_id,
+                    results,
+                  });
+                  this.log("info", "elo game recorded", {
+                    mission_id: mission.mission_id,
+                    winner: game.winner_runtime,
+                    deltas: game.results.map((r) => `${r.runtime}:${r.delta.toFixed(1)}`),
+                  });
+                }
+              } catch (err) {
+                this.log("warn", "elo game recording failed", {
+                  mission_id: mission.mission_id,
+                  error: err instanceof Error ? err.message : String(err),
+                });
+              }
+            }
           }
         }
       } catch (err) {
@@ -852,6 +946,25 @@ export class NodeAgent {
   // ────────────────────────────────────────────────────────────────────────
   // Private: ProcessWatcher watch helper
   // ────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Read the captured output file for an arm and classify a failure.
+   * Returns null if no output or no signature matches. Called by the
+   * failure paths in pollTick so operators see `auth_required` instead
+   * of a generic `exit_code_1`.
+   */
+  private classifyArmFailure(arm_id: string): string | null {
+    try {
+      const outputPath = path.join(this.sentinelDir, `${arm_id}.output`);
+      if (!existsSync(outputPath)) {
+        return null;
+      }
+      const text = readFileSync(outputPath, "utf8");
+      return classifyFailure(text);
+    } catch {
+      return null;
+    }
+  }
 
   private watchArm(arm: ArmRecord): void {
     const sessionName = `${this.sessionNamePrefix}${arm.arm_id}`;
