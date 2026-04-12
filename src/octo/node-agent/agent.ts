@@ -35,6 +35,14 @@ import { TmuxManager } from "./tmux-manager.ts";
 // Public types
 // ──────────────────────────────────────────────────────────────────────────
 
+export interface RemoteNodeConfig {
+  host: string;
+  user: string;
+  password?: string;
+  keyPath?: string;
+  sentinelDir?: string;
+}
+
 export interface NodeAgentOptions {
   nodeId: string;
   registry: RegistryService;
@@ -46,6 +54,8 @@ export interface NodeAgentOptions {
   /** Directory for sentinel files. Defaults to <os.tmpdir()>/octo-sentinels. */
   sentinelDir?: string;
   now?: () => number;
+  /** Remote node configs for distributed arm polling. */
+  remoteNodes?: Map<string, RemoteNodeConfig>;
   logger?: (entry: {
     level: "info" | "warn" | "error";
     message: string;
@@ -74,6 +84,8 @@ export class NodeAgent {
   private readonly reconciler: SessionReconciler;
   private readonly logger: NodeAgentOptions["logger"];
 
+  private readonly remoteNodes: Map<string, RemoteNodeConfig>;
+
   private pollHandle: ReturnType<typeof setInterval> | null = null;
   private running = false;
   private pollInFlight = false;
@@ -96,6 +108,7 @@ export class NodeAgent {
         "octo-sentinels",
       );
     this.nowFn = opts.now ?? (() => Date.now());
+    this.remoteNodes = opts.remoteNodes ?? new Map();
     this.logger = opts.logger;
 
     this.processWatcher = new ProcessWatcher({
@@ -217,10 +230,13 @@ export class NodeAgent {
 
       // 3. For each starting arm, check liveness.
       for (const arm of startingArms) {
-        // Only poll tmux sessions for pty_tmux arms. Other adapter types
-        // (e.g. cli_exec, structured_subagent) don't have tmux sessions,
-        // so checking tmux liveness would incorrectly drive them to failed.
+        // Only poll LOCAL tmux sessions for pty_tmux arms. Skip remote arms
+        // (they're handled in step 4) and non-pty_tmux adapters.
         if (arm.adapter_type !== "pty_tmux") {
+          continue;
+        }
+        // Remote arms have target_node in spec labels — skip local check.
+        if (arm.spec?.labels?.target_node) {
           continue;
         }
 
@@ -289,6 +305,111 @@ export class NodeAgent {
                 reason: "session_not_found_on_poll",
               });
             }
+          }
+        }
+      }
+      // 4. Poll remote arms — arms with target_node label that are in
+      //    starting state. Check their sentinel files via SSH.
+      if (this.remoteNodes.size > 0) {
+        const remoteArms = startingArms.filter(
+          (arm) => arm.adapter_type === "pty_tmux" && arm.spec?.labels?.target_node,
+        );
+        for (const arm of remoteArms) {
+          const targetNodeId = arm.spec.labels.target_node;
+          const nodeConfig = this.remoteNodes.get(targetNodeId);
+          if (!nodeConfig) {
+            continue;
+          }
+
+          const remoteSentinelDir = nodeConfig.sentinelDir ?? "/tmp/octo-sentinels";
+          const remoteSentinelPath = `${remoteSentinelDir}/${arm.arm_id}.exit`;
+          const remoteOutputPath = `${remoteSentinelDir}/${arm.arm_id}.output`;
+
+          try {
+            const { execFile: execFileCb } = await import("node:child_process");
+            const { promisify } = await import("node:util");
+            const execFileAsync = promisify(execFileCb);
+
+            // Build SSH args
+            const sshArgs: string[] = ["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5"];
+            if (nodeConfig.keyPath) {
+              sshArgs.push("-i", nodeConfig.keyPath);
+            }
+            sshArgs.push(
+              `${nodeConfig.user}@${nodeConfig.host}`,
+              `cat ${remoteSentinelPath} 2>/dev/null || echo __PENDING__`,
+            );
+
+            let cmd: string;
+            let cmdArgs: string[];
+            if (nodeConfig.password) {
+              cmd = "sshpass";
+              cmdArgs = ["-p", nodeConfig.password, "ssh", ...sshArgs];
+            } else {
+              cmd = "ssh";
+              cmdArgs = sshArgs;
+            }
+
+            const result = await execFileAsync(cmd, cmdArgs, { timeout: 10000 });
+            const content = result.stdout.trim();
+
+            if (content !== "__PENDING__" && /^-?\d+$/.test(content)) {
+              const exitCode = parseInt(content, 10);
+              const targetState = exitCode === 0 ? "completed" : "failed";
+
+              // Pull output file from remote
+              try {
+                const pullArgs = [...sshArgs.slice(0, -1), `cat ${remoteOutputPath} 2>/dev/null`];
+                let pullCmd: string;
+                let pullCmdArgs: string[];
+                if (nodeConfig.password) {
+                  pullCmd = "sshpass";
+                  pullCmdArgs = ["-p", nodeConfig.password, "ssh", ...pullArgs];
+                } else {
+                  pullCmd = "ssh";
+                  pullCmdArgs = pullArgs;
+                }
+                const outputResult = await execFileAsync(pullCmd, pullCmdArgs, { timeout: 15000 });
+                const localOutputPath = path.join(this.sentinelDir, `${arm.arm_id}.output`);
+                writeFileSync(localOutputPath, outputResult.stdout);
+              } catch {
+                // Best effort output pull
+              }
+
+              // Write local sentinel
+              const localSentinelPath = path.join(this.sentinelDir, `${arm.arm_id}.exit`);
+              writeFileSync(localSentinelPath, String(exitCode));
+
+              // Transition arm: starting → active → completed/failed
+              const activated = await this.transitionArm(arm, "active", "arm.active");
+              if (activated) {
+                const updatedArm = this.registry.getArm(arm.arm_id);
+                if (updatedArm) {
+                  await this.transitionArm(
+                    updatedArm,
+                    targetState,
+                    targetState === "completed" ? "arm.completed" : "arm.failed",
+                    {
+                      exit_code: exitCode,
+                      remote_node: targetNodeId,
+                    },
+                  );
+                }
+              }
+
+              this.log("info", `remote arm ${targetState} on ${targetNodeId}`, {
+                arm_id: arm.arm_id,
+                exit_code: exitCode,
+                remote_node: targetNodeId,
+              });
+            }
+          } catch (err) {
+            // SSH check failed — skip this tick, retry next.
+            this.log("warn", "remote arm sentinel check failed", {
+              arm_id: arm.arm_id,
+              target_node: targetNodeId,
+              error: err instanceof Error ? err.message : String(err),
+            });
           }
         }
       }
