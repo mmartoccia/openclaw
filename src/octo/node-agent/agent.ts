@@ -684,6 +684,27 @@ export class NodeAgent {
 
             // Read outputs from completed dependency grips so we can
             // inject them into the judge prompt via string substitution.
+            //
+            // Per-output cap: 80 KB. The cascade substitutes these
+            // strings into the round-N prompt which becomes a CLI
+            // argument to the runtime executable. macOS / Linux have
+            // a hard kernel limit on argv+envp (ARG_MAX, typically
+            // 256 KB on macOS, 2 MB on Linux), and exceeding it
+            // produces "Argument list too long" (errno E2BIG, exit
+            // code 126) before the runtime even starts. Bug
+            // discovered on 2026-04-12 mission mis-b655ec9f when
+            // codex round-2 produced a 1.3 MB source-landscape
+            // analysis that the round-3 gemini arm couldn't ingest.
+            //
+            // 80 KB per dependency output is enough context for
+            // a refining round to see substantive prior work
+            // (~10-15K tokens) while leaving headroom for several
+            // dependencies plus the framing prompt to fit under
+            // ARG_MAX even on tight platforms. If the output is
+            // truncated, we mark it inline so the receiving model
+            // knows it's seeing a head-truncated view rather than
+            // the full document.
+            const MAX_DEP_OUTPUT_BYTES = 80_000;
             const depOutputs: Record<string, string> = {};
             const os = await import("node:os");
             const fs = await import("node:fs");
@@ -695,7 +716,15 @@ export class NodeAgent {
               if (depGrip?.assigned_arm_id) {
                 const outputFile = pathMod.join(sentinelDir, `${depGrip.assigned_arm_id}.output`);
                 try {
-                  depOutputs[depId] = fs.readFileSync(outputFile, "utf8").trim();
+                  const raw = fs.readFileSync(outputFile, "utf8").trim();
+                  if (raw.length > MAX_DEP_OUTPUT_BYTES) {
+                    const head = raw.slice(0, MAX_DEP_OUTPUT_BYTES);
+                    const droppedBytes = raw.length - MAX_DEP_OUTPUT_BYTES;
+                    depOutputs[depId] =
+                      `${head}\n\n[octo: prior output truncated — ${droppedBytes} bytes omitted to fit ARG_MAX]`;
+                  } else {
+                    depOutputs[depId] = raw;
+                  }
                 } catch {
                   depOutputs[depId] = "(output not captured)";
                 }

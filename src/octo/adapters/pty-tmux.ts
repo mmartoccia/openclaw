@@ -21,7 +21,7 @@
 // implicit Enter.
 
 import { execFile } from "node:child_process";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import type { TmuxManager } from "../node-agent/tmux-manager.ts";
@@ -123,6 +123,7 @@ export class PtyTmuxAdapter implements Adapter {
       const outputPath = join(this.sentinelDir, `${armId}.output`);
       const touchedPath = join(this.sentinelDir, `${armId}.touched-files`);
       const startMarkerPath = join(this.sentinelDir, `${armId}.start-marker`);
+      const scriptPath = join(this.sentinelDir, `${armId}.sh`);
       // Wrap the user command with:
       //   (1) a start-marker file (touched before the run) so we can
       //       later diff the cwd for files newer than that marker
@@ -139,32 +140,48 @@ export class PtyTmuxAdapter implements Adapter {
       // promotion is best-effort and must never mask the user command's
       // exit code, which is the only signal ProcessWatcher uses to
       // drive arm state transitions.
+      //
+      // CRITICAL: write the wrapper to a SCRIPT FILE rather than
+      // passing it as an inline command string to tmux. tmux's
+      // new-session has an arg-length limit, and collaborative-chain
+      // round-2/3 prompts now contain substituted dependency output
+      // (potentially several KB of prior round content). Inline
+      // command strings hit `tmux new-session failed: command too
+      // long` once the prompt grows beyond a few KB. By writing the
+      // wrapper to <sentinelDir>/<armId>.sh and invoking
+      // `bash <script>` via tmux, the tmux command stays short
+      // regardless of how long the user prompt is — only the file
+      // contents need to fit on disk. Bug discovered mid-rerun on
+      // 2026-04-12 mission mis-0841157f.
       const cwdQuoted = shellQuote(spec.cwd);
-      cmd =
-        `touch ${startMarkerPath}; ` +
-        `${userCmd} 2>&1 | tee ${outputPath}; ` +
-        `_ec=\${PIPESTATUS[0]:-$?}; ` +
+      const scriptBody =
+        `#!/bin/bash\n` +
+        `# Auto-generated wrapper for octo arm ${armId}\n` +
+        `# Lifecycle: start-marker → user command (tee'd) → manifest find → sentinel exit\n` +
+        `touch ${startMarkerPath}\n` +
+        `${userCmd} 2>&1 | tee ${outputPath}\n` +
+        `_ec=\${PIPESTATUS[0]:-$?}\n` +
         // -H: follow symlinks given as command-line args. Without this
         // flag, `find /tmp ...` on macOS treats /tmp as a symlink and
-        // doesn't descend into it (because /tmp → /private/tmp). This
-        // caused every manifest to come out empty on 2026-04-12 until
-        // the bug-within-the-bug was isolated mid-probe.
-        `(find -H ${cwdQuoted} -type f -newer ${startMarkerPath} ` +
-        `  -not -path '*/node_modules/*' ` +
-        `  -not -path '*/.git/*' ` +
-        `  -not -path '*/.DS_Store' ` +
-        `  -not -path '*/dist/*' ` +
-        `  -not -path '*/.next/*' ` +
-        `  -not -path '*/.venv/*' ` +
-        `  -not -path '*/octo-sentinels/*' ` +
-        `  -not -path '*/claude-*/*/tasks/*' ` +
-        `  -not -path '*/.cache/*' ` +
-        `  -not -name '*.pyc' ` +
-        `  -not -name '*.log' ` +
-        `  > ${touchedPath} 2>/dev/null) || true; ` +
-        `rm -f ${startMarkerPath}; ` +
-        `echo $_ec > ${sentinelPath}; ` +
-        `exit $_ec`;
+        // doesn't descend into it (because /tmp → /private/tmp).
+        `(find -H ${cwdQuoted} -type f -newer ${startMarkerPath} \\\n` +
+        `  -not -path '*/node_modules/*' \\\n` +
+        `  -not -path '*/.git/*' \\\n` +
+        `  -not -path '*/.DS_Store' \\\n` +
+        `  -not -path '*/dist/*' \\\n` +
+        `  -not -path '*/.next/*' \\\n` +
+        `  -not -path '*/.venv/*' \\\n` +
+        `  -not -path '*/octo-sentinels/*' \\\n` +
+        `  -not -path '*/claude-*/*/tasks/*' \\\n` +
+        `  -not -path '*/.cache/*' \\\n` +
+        `  -not -name '*.pyc' \\\n` +
+        `  -not -name '*.log' \\\n` +
+        `  > ${touchedPath} 2>/dev/null) || true\n` +
+        `rm -f ${startMarkerPath}\n` +
+        `echo $_ec > ${sentinelPath}\n` +
+        `exit $_ec\n`;
+      writeFileSync(scriptPath, scriptBody, { mode: 0o755 });
+      cmd = `bash ${scriptPath}`;
     } else {
       cmd = userCmd;
     }

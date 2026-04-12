@@ -295,17 +295,29 @@ export function registerOctoCli(program: Command) {
           command: "aider",
           buildArgs: (p) => ["--yes", ...(p ? ["--message", p] : [])],
         },
-        // openclaw runtime — runs one agent turn through the gateway using
-        // the `main` agent. The tee'd stdout captures the model's reply as
-        // plain text, so Octo's artifact promotion can treat it uniformly
-        // with codex/gemini/etc. Historical bug: the previous fallback
-        // path created `{command: "openclaw"}` with no args, which just
-        // printed `openclaw --help` and captured the help banner as output.
-        // See the 2026-04-12 teleconference transcript for the diagnosis.
-        openclaw: {
-          command: "openclaw",
-          buildArgs: (p) => ["agent", "--agent", "main", ...(p ? ["--message", p] : [])],
-        },
+        // NOTE: there is intentionally no `openclaw` runtime profile.
+        // A previous iteration added one that mapped to
+        // `openclaw agent --agent main --message <task>`, which routed
+        // the task through the gateway's API path (the configured
+        // model provider for the `main` agent — typically a direct
+        // OpenAI/Anthropic API call using the operator's API key,
+        // NOT one of the local CLI tool subscriptions).
+        //
+        // This was a meta-wrapper footgun: it had the same name as
+        // the orchestration product itself, hid the actual execution
+        // path, and created false comparability with the real CLI
+        // runtimes (claude/codex/gemini) when used in collaborative
+        // or competitive missions. Per the 2026-04-12 working session
+        // (Michael + claude-code + openclaw-main agent), the profile
+        // was removed entirely. Use claude/codex/gemini directly via
+        // their CLIs — those go through your local subscription, not
+        // a raw API key path.
+        //
+        // If you need the `main` agent's pipeline (memory, skills,
+        // hooks) as a participant in a mission, that should be a
+        // distinct, explicitly-named runtime (e.g. `main-agent`) and
+        // its docs should call out the API-path semantics. Don't
+        // re-add this under the name `openclaw`.
       };
       // Use pty_tmux adapter — it has the full lifecycle wired through
       // ProcessWatcher (sentinel files, tmux session monitoring, arm
