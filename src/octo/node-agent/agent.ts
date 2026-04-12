@@ -840,10 +840,39 @@ export class NodeAgent {
             allGrips.length > 0 &&
             allGrips.every((g) => g.status === "completed" || g.status === "archived");
           if (allDone) {
-            // Resolve the output artifact — the last grip's arm output.
-            // For competitive missions, this is the verdict grip's output.
-            // For direct_execute, it's the last completed grip's output.
-            //
+            // Resolve the output artifact — the terminal grip in the
+            // DAG (no other grip depends on it). For competitive
+            // missions this is `verdict`; for collaborative chains
+            // it's the last round; for council it's `synthesize`; for
+            // consensus it's `validate`. We compute it from the
+            // mission's graph spec rather than using `allGrips[0]`
+            // because grips inserted in the same millisecond batch
+            // tie on `created_at` and SQLite's DESC sort returns them
+            // in arbitrary order — that bug caused
+            // mis-8fda8e96-3f20-47f5-a4fd-5c9ee6556dd6 to label
+            // round-1's stdout as `_output_artifact` instead of
+            // round-N's haiku file.
+            const missionGraph = (mission.spec.graph ?? []) as Array<{
+              grip_id: string;
+              depends_on?: string[];
+            }>;
+            const allDependencies = new Set<string>();
+            for (const node of missionGraph) {
+              for (const dep of node.depends_on ?? []) {
+                allDependencies.add(dep);
+              }
+            }
+            const terminalGripIds = new Set(
+              missionGraph
+                .filter((node) => !allDependencies.has(node.grip_id))
+                .map((node) => node.grip_id),
+            );
+            // Namespace the terminal grip ids with the mission id to
+            // match the registry's storage convention.
+            const terminalNamespacedIds = new Set(
+              [...terminalGripIds].map((id) => `${mission.mission_id}/${id}`),
+            );
+
             // Persist every completed arm's output into the durable
             // artifacts tree at ~/.openclaw/octo/artifacts/<mission>/ so
             // the outputs survive reboot (macOS wipes $TMPDIR). The
@@ -913,13 +942,17 @@ export class NodeAgent {
 
               // Copy the tee stdout file if present.
               let teeCopied = false;
+              const isTerminalGrip = terminalNamespacedIds.has(grip.grip_id);
               if (hasTee) {
                 const teeDst = path.join(gripSubdir, `${grip.assigned_arm_id}.stdout.txt`);
                 try {
                   copyFileSync(srcPath, teeDst);
                   teeCopied = true;
                   copiedCount++;
-                  if (grip === allGrips[0]) {
+                  // Only set outputArtifactPath from a terminal grip;
+                  // for grips with manifest files we'll prefer those
+                  // below.
+                  if (isTerminalGrip && !outputArtifactPath) {
                     outputArtifactPath = teeDst;
                   }
                 } catch (err) {
@@ -957,10 +990,11 @@ export class NodeAgent {
                       copyFileSync(absSrc, manifestDst);
                       filesCopied++;
                       copiedCount++;
-                      // If this grip is the canonical output and
-                      // nothing else set outputArtifactPath yet, use
-                      // the first manifest file we copy.
-                      if (!outputArtifactPath && grip === allGrips[0]) {
+                      // If this grip is a terminal node, prefer
+                      // the first manifest file as the canonical
+                      // output (the actual artifact, not the stdout
+                      // summary).
+                      if (isTerminalGrip) {
                         outputArtifactPath = manifestDst;
                       }
                     } catch (err) {

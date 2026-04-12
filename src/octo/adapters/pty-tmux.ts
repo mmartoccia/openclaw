@@ -144,13 +144,21 @@ export class PtyTmuxAdapter implements Adapter {
         `touch ${startMarkerPath}; ` +
         `${userCmd} 2>&1 | tee ${outputPath}; ` +
         `_ec=\${PIPESTATUS[0]:-$?}; ` +
-        `(find ${cwdQuoted} -type f -newer ${startMarkerPath} ` +
+        // -H: follow symlinks given as command-line args. Without this
+        // flag, `find /tmp ...` on macOS treats /tmp as a symlink and
+        // doesn't descend into it (because /tmp → /private/tmp). This
+        // caused every manifest to come out empty on 2026-04-12 until
+        // the bug-within-the-bug was isolated mid-probe.
+        `(find -H ${cwdQuoted} -type f -newer ${startMarkerPath} ` +
         `  -not -path '*/node_modules/*' ` +
         `  -not -path '*/.git/*' ` +
         `  -not -path '*/.DS_Store' ` +
         `  -not -path '*/dist/*' ` +
         `  -not -path '*/.next/*' ` +
         `  -not -path '*/.venv/*' ` +
+        `  -not -path '*/octo-sentinels/*' ` +
+        `  -not -path '*/claude-*/*/tasks/*' ` +
+        `  -not -path '*/.cache/*' ` +
         `  -not -name '*.pyc' ` +
         `  -not -name '*.log' ` +
         `  > ${touchedPath} 2>/dev/null) || true; ` +
