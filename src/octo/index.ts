@@ -252,6 +252,7 @@ export async function initOctopus(deps: OctopusDeps): Promise<OctopusInstance> {
     eventLog,
     tmuxManager,
     pollIntervalMs: 1000,
+    remoteNodes: remoteNodes.size > 0 ? remoteNodes : undefined,
   });
   let reconciliationReport;
   try {
