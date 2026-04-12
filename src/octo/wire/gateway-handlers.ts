@@ -404,6 +404,30 @@ export class OctoGatewayHandlers {
     if (targetNode && this.remoteNodes && this.remoteNodes.size > 0) {
       // eslint-disable-next-line no-console
       console.info(`[octo] Using RemotePtyTmuxAdapter for node=${targetNode}`);
+
+      // Enforce per-node concurrent arm cap. Memory-constrained
+      // remotes (e.g., RPi5 with 4GB RAM) break down under more than
+      // 1–2 concurrent CLI agents. The cap is checked against live
+      // arms in `starting` or `active` state on that target node.
+      const nodeCfg = this.remoteNodes.get(targetNode);
+      const cap = nodeCfg?.maxConcurrentArms;
+      if (cap !== undefined && cap > 0) {
+        const liveOnNode = this.registry
+          .listArms()
+          .filter(
+            (a) =>
+              (a.state === "starting" || a.state === "active") &&
+              a.spec?.labels?.target_node === targetNode,
+          ).length;
+        if (liveOnNode >= cap) {
+          throw new HandlerError(
+            "policy_denied",
+            `octo.arm.spawn: target_node ${targetNode} at max_concurrent_arms=${cap} ` +
+              `(${liveOnNode} live). Wait for an arm to complete.`,
+          );
+        }
+      }
+
       // Reuse singleton so SSH pollers survive across armSpawn calls.
       if (!this.remoteAdapter) {
         this.remoteAdapter = new RemotePtyTmuxAdapter({

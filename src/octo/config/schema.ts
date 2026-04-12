@@ -342,6 +342,12 @@ export const OctoConfigSchema = Type.Object(
             user: NonEmptyString,
             password: Type.Optional(Type.String()),
             key_path: Type.Optional(Type.String()),
+            /** Max concurrent arms allowed on this node. Guards
+             *  memory-constrained remotes (e.g., RPi5 with 4GB RAM).
+             *  When the live arm count for this node hits the cap the
+             *  scheduler defers new assignments. Defaults to unlimited
+             *  when absent. */
+            max_concurrent_arms: Type.Optional(Type.Integer({ minimum: 1 })),
           },
           { additionalProperties: false },
         ),
