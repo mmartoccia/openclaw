@@ -71,6 +71,11 @@ const coreCliCommandCatalog = defineCommandDescriptorCatalog([
     hasSubcommands: true,
   },
   {
+    name: "meet",
+    description: "Agent teleconference — scoped meetings between agents",
+    hasSubcommands: true,
+  },
+  {
     name: "status",
     description: "Show channel health and recent session recipients",
     hasSubcommands: false,
