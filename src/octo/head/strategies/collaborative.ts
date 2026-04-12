@@ -16,6 +16,7 @@
 
 import type { ArmTemplate } from "../../wire/schema.ts";
 import type { ExpandedGraph, GraphNode, CompetitiveExpandOptions } from "./competitive.ts";
+import { rewriteArgsForPrompt } from "./rewrite-prompt.ts";
 
 // ──────────────────────────────────────────────────────────────────────────
 // Round prompt builders
@@ -95,7 +96,23 @@ export function expandCollaborativeGraph(opts: CompetitiveExpandOptions): Expand
       roundPrompt = buildRefinePrompt(prompt, round, totalRounds, priorRuntime, prevGripId!);
     }
 
-    armTemplatesByGrip.set(roundId, [{ ...tmpl, initial_input: roundPrompt }]);
+    // Rewrite runtime_options.args so the CLI invocation receives the
+    // framed round prompt, not the raw original task. Phase-1 arms
+    // with no dependencies bake the draft framing directly. Phase-2+
+    // arms retain the `[Output will be provided from grip: X]`
+    // placeholder in args; the NodeAgent cascade handler resolves
+    // it against the completed dependency's output just before
+    // spawning.
+    const rewrittenRuntimeOptions =
+      rewriteArgsForPrompt(tmpl.runtime_options, prompt, roundPrompt) ?? tmpl.runtime_options;
+
+    armTemplatesByGrip.set(roundId, [
+      {
+        ...tmpl,
+        initial_input: roundPrompt,
+        runtime_options: rewrittenRuntimeOptions,
+      },
+    ]);
 
     prevGripId = roundId;
   }

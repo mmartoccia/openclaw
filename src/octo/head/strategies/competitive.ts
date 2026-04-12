@@ -18,6 +18,7 @@
 // (the judge model can be overridden via judge_template on the spec).
 
 import type { ArmTemplate } from "../../wire/schema.ts";
+import { rewriteArgsForPrompt } from "./rewrite-prompt.ts";
 
 // ──────────────────────────────────────────────────────────────────────────
 // Types
@@ -197,8 +198,16 @@ export function expandCompetitiveGraph(opts: CompetitiveExpandOptions): Expanded
       }));
 
     const judgePrompt = buildPeerJudgePrompt(prompt, tmpl.runtime_name, reviews);
+    const judgeRuntimeOptions =
+      rewriteArgsForPrompt(judgeBase.runtime_options, prompt, judgePrompt) ??
+      judgeBase.runtime_options;
     armTemplatesByGrip.set(judgeId, [
-      { ...judgeBase, runtime_name: tmpl.runtime_name, initial_input: judgePrompt },
+      {
+        ...judgeBase,
+        runtime_name: tmpl.runtime_name,
+        initial_input: judgePrompt,
+        runtime_options: judgeRuntimeOptions,
+      },
     ]);
   }
 
@@ -210,8 +219,16 @@ export function expandCompetitiveGraph(opts: CompetitiveExpandOptions): Expanded
     armTemplates.map((t) => t.runtime_name),
     armTemplates.length,
   );
+  const verdictRuntimeOptions =
+    rewriteArgsForPrompt(verdictBase.runtime_options, prompt, verdictPrompt) ??
+    verdictBase.runtime_options;
   armTemplatesByGrip.set(verdictId, [
-    { ...verdictBase, runtime_name: "verdict", initial_input: verdictPrompt },
+    {
+      ...verdictBase,
+      runtime_name: "verdict",
+      initial_input: verdictPrompt,
+      runtime_options: verdictRuntimeOptions,
+    },
   ]);
 
   return { graph, armTemplatesByGrip };
@@ -249,8 +266,16 @@ export function expandSingleJudgeGraph(opts: CompetitiveExpandOptions): Expanded
     gripId: `${gripId}:work:${t.runtime_name}`,
   }));
   const judgePrompt = buildSingleJudgePrompt(prompt, contestants);
+  const judgeRuntimeOptions =
+    rewriteArgsForPrompt(judgeBase.runtime_options, prompt, judgePrompt) ??
+    judgeBase.runtime_options;
   armTemplatesByGrip.set(judgeId, [
-    { ...judgeBase, runtime_name: "judge", initial_input: judgePrompt },
+    {
+      ...judgeBase,
+      runtime_name: "judge",
+      initial_input: judgePrompt,
+      runtime_options: judgeRuntimeOptions,
+    },
   ]);
 
   return { graph, armTemplatesByGrip };

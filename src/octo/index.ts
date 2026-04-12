@@ -265,6 +265,13 @@ export async function initOctopus(deps: OctopusDeps): Promise<OctopusInstance> {
   const handlers = new OctoGatewayHandlers(handlerDeps);
 
   // 6. Start Node Agent (reconcile + polling loop)
+  // Wire a logger — prior to 2026-04-12 this was omitted, which made
+  // the NodeAgent silent about every warn/error (mission completion,
+  // artifact copy failures, phase cascade errors, remote sentinel
+  // polling, etc). The copy loop would log "failed to copy arm output"
+  // as warn, but nobody could see it. See teleconference meeting
+  // mtg_1776010525498_a4d275 for the diagnosis trail.
+  const nodeAgentLogger = new OctoLogger("octo:node-agent", logProvider);
   const nodeAgent = new NodeAgent({
     nodeId: deps.nodeId,
     registry,
@@ -273,6 +280,18 @@ export async function initOctopus(deps: OctopusDeps): Promise<OctopusInstance> {
     pollIntervalMs: 1000,
     remoteNodes: remoteNodes.size > 0 ? remoteNodes : undefined,
     elo,
+    logger: (entry) => {
+      const msg = entry.details
+        ? `${entry.message} ${JSON.stringify(entry.details)}`
+        : entry.message;
+      if (entry.level === "error") {
+        nodeAgentLogger.error(msg);
+      } else if (entry.level === "warn") {
+        nodeAgentLogger.warn(msg);
+      } else {
+        nodeAgentLogger.info(msg);
+      }
+    },
   });
   let reconciliationReport;
   try {

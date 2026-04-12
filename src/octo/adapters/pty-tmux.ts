@@ -120,12 +120,43 @@ export class PtyTmuxAdapter implements Adapter {
     if (armId) {
       mkdirSync(this.sentinelDir, { recursive: true });
       const sentinelPath = join(this.sentinelDir, `${armId}.exit`);
-      // Sentinel paths are under tmpdir and contain only alphanumeric/dash/dot
-      // characters, so direct interpolation is safe.
-      // Capture stdout to a file via tee so artifacts can be read after
-      // the tmux session closes. Write exit code to sentinel via PIPESTATUS.
       const outputPath = join(this.sentinelDir, `${armId}.output`);
-      cmd = `${userCmd} 2>&1 | tee ${outputPath}; _ec=\${PIPESTATUS[0]:-$?}; echo $_ec > ${sentinelPath}; exit $_ec`;
+      const touchedPath = join(this.sentinelDir, `${armId}.touched-files`);
+      const startMarkerPath = join(this.sentinelDir, `${armId}.start-marker`);
+      // Wrap the user command with:
+      //   (1) a start-marker file (touched before the run) so we can
+      //       later diff the cwd for files newer than that marker
+      //   (2) tee stdout capture (for stdout-model runtimes like codex)
+      //   (3) sentinel exit-code file (so ProcessWatcher sees completion)
+      //   (4) touched-files manifest (for filesystem-model runtimes
+      //       like Claude Code, which write artifacts to disk rather
+      //       than stdout — NodeAgent reads this file during mission
+      //       completion and copies each listed path into the mission
+      //       artifact tree).
+      //
+      // The find excludes common noise directories. Exit codes from
+      // the manifest generation are intentionally ignored — artifact
+      // promotion is best-effort and must never mask the user command's
+      // exit code, which is the only signal ProcessWatcher uses to
+      // drive arm state transitions.
+      const cwdQuoted = shellQuote(spec.cwd);
+      cmd =
+        `touch ${startMarkerPath}; ` +
+        `${userCmd} 2>&1 | tee ${outputPath}; ` +
+        `_ec=\${PIPESTATUS[0]:-$?}; ` +
+        `(find ${cwdQuoted} -type f -newer ${startMarkerPath} ` +
+        `  -not -path '*/node_modules/*' ` +
+        `  -not -path '*/.git/*' ` +
+        `  -not -path '*/.DS_Store' ` +
+        `  -not -path '*/dist/*' ` +
+        `  -not -path '*/.next/*' ` +
+        `  -not -path '*/.venv/*' ` +
+        `  -not -name '*.pyc' ` +
+        `  -not -name '*.log' ` +
+        `  > ${touchedPath} 2>/dev/null) || true; ` +
+        `rm -f ${startMarkerPath}; ` +
+        `echo $_ec > ${sentinelPath}; ` +
+        `exit $_ec`;
     } else {
       cmd = userCmd;
     }

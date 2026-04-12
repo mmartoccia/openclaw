@@ -20,6 +20,7 @@
 
 import type { ArmTemplate } from "../../wire/schema.ts";
 import type { ExpandedGraph, GraphNode, CompetitiveExpandOptions } from "./competitive.ts";
+import { rewriteArgsForPrompt } from "./rewrite-prompt.ts";
 
 // ──────────────────────────────────────────────────────────────────────────
 // Validator prompt builder
@@ -92,8 +93,18 @@ export function expandConsensusGraph(opts: CompetitiveExpandOptions): ExpandedGr
     gripId: `${gripId}:work:${t.runtime_name}`,
   }));
   const validatorPrompt = buildValidatorPrompt(prompt, contributors);
+  // Rewrite args so validator CLI invocation carries the framed prompt
+  // (placeholders resolved by cascade handler at spawn time).
+  const validatorRuntimeOptions =
+    rewriteArgsForPrompt(validatorBase.runtime_options, prompt, validatorPrompt) ??
+    validatorBase.runtime_options;
   armTemplatesByGrip.set(validatorId, [
-    { ...validatorBase, runtime_name: "validator", initial_input: validatorPrompt },
+    {
+      ...validatorBase,
+      runtime_name: "validator",
+      initial_input: validatorPrompt,
+      runtime_options: validatorRuntimeOptions,
+    },
   ]);
 
   return { graph, armTemplatesByGrip };

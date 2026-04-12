@@ -727,6 +727,31 @@ export class NodeAgent {
                 prompt = prompt.replace(`[Output will be provided from grip: ${depId}]`, output);
               }
 
+              // Also resolve the same placeholders inside
+              // runtime_options.args so the CLI invocation actually
+              // carries the substituted prompt. Strategies pre-bake
+              // the framed-with-placeholder prompt into args; here we
+              // do the dependency-output substitution pass so the
+              // resolved text reaches the runtime. Without this step
+              // the cascade runs the framed-but-unresolved string,
+              // which is the Bug 2 symptom from
+              // mis-a58fc01e-60a5-43c9-b9ef-134cb42219bb.
+              let rewrittenRuntimeOptions = template.runtime_options as Record<string, unknown>;
+              const rtArgs = rewrittenRuntimeOptions?.args;
+              if (Array.isArray(rtArgs)) {
+                const resolvedArgs = rtArgs.map((a: unknown) => {
+                  if (typeof a !== "string") {
+                    return a;
+                  }
+                  let out = a;
+                  for (const [depId, output] of Object.entries(depOutputs)) {
+                    out = out.split(`[Output will be provided from grip: ${depId}]`).join(output);
+                  }
+                  return out;
+                });
+                rewrittenRuntimeOptions = { ...rewrittenRuntimeOptions, args: resolvedArgs };
+              }
+
               const armIdempotencyKey = `${mission.mission_id}:${graphNode.grip_id}:${template.runtime_name}:auto`;
               try {
                 const { OctoGatewayHandlers } = await import("../wire/gateway-handlers.js");
@@ -770,7 +795,7 @@ export class NodeAgent {
                     runtime_name: template.runtime_name,
                     agent_id: template.agent_id,
                     cwd: template.cwd ?? process.cwd(),
-                    runtime_options: template.runtime_options as Record<string, unknown>,
+                    runtime_options: rewrittenRuntimeOptions,
                     idempotency_key: armIdempotencyKey,
                     initial_input: prompt,
                     labels: {
@@ -836,34 +861,143 @@ export class NodeAgent {
               });
             }
 
+            this.log("info", "mission artifact promotion: begin", {
+              mission_id: mission.mission_id,
+              grip_count: allGrips.length,
+              sent_dir: sentDir,
+              mission_artifact_dir: missionArtifactDir,
+            });
+
             let outputArtifactPath: string | undefined;
+            let copiedCount = 0;
+            let skippedNoArm = 0;
+            let skippedNoSrc = 0;
+            let copyErrors = 0;
             for (const grip of allGrips) {
               if (!grip.assigned_arm_id) {
+                skippedNoArm++;
                 continue;
               }
+              // Also attempt to read a touched-files manifest for the
+              // arm (Bug 3 fix): if the pty-tmux wrapper wrote one,
+              // copy every listed file into a per-grip subdirectory in
+              // the mission artifact tree. Files preserve their path
+              // below the arm's working directory when possible.
+              const touchedPath = path.join(sentDir, `${grip.assigned_arm_id}.touched-files`);
               const srcPath = path.join(sentDir, `${grip.assigned_arm_id}.output`);
-              if (!existsSync(srcPath)) {
+              const hasTee = existsSync(srcPath);
+              const hasManifest = existsSync(touchedPath);
+
+              // Slug the grip_id so colons don't break `tree` and other
+              // path-walking tools (colons are legal on APFS but fragile
+              // elsewhere and awkward in shells).
+              const gripSlug = grip.grip_id.replace(/[^A-Za-z0-9._-]+/g, "_");
+              const gripSubdir = path.join(missionArtifactDir, gripSlug);
+              try {
+                mkdirSync(gripSubdir, { recursive: true });
+              } catch {
+                // ignore — will re-throw below if copy fails
+              }
+
+              if (!hasTee && !hasManifest) {
+                skippedNoSrc++;
+                this.log("warn", "artifact promotion: no tee or manifest for arm", {
+                  mission_id: mission.mission_id,
+                  grip_id: grip.grip_id,
+                  arm_id: grip.assigned_arm_id,
+                  checked_src: srcPath,
+                  checked_manifest: touchedPath,
+                });
                 continue;
               }
-              const dstPath = path.join(
-                missionArtifactDir,
-                `${grip.grip_id}-${grip.assigned_arm_id}.txt`,
-              );
-              try {
-                copyFileSync(srcPath, dstPath);
-                // The last grip (sorted DESC → allGrips[0]) is the
-                // mission's canonical output.
-                if (grip === allGrips[0]) {
-                  outputArtifactPath = dstPath;
+
+              // Copy the tee stdout file if present.
+              let teeCopied = false;
+              if (hasTee) {
+                const teeDst = path.join(gripSubdir, `${grip.assigned_arm_id}.stdout.txt`);
+                try {
+                  copyFileSync(srcPath, teeDst);
+                  teeCopied = true;
+                  copiedCount++;
+                  if (grip === allGrips[0]) {
+                    outputArtifactPath = teeDst;
+                  }
+                } catch (err) {
+                  copyErrors++;
+                  this.log("warn", "artifact promotion: tee copy failed", {
+                    arm_id: grip.assigned_arm_id,
+                    grip_id: grip.grip_id,
+                    src: srcPath,
+                    dst: teeDst,
+                    error: err instanceof Error ? err.message : String(err),
+                  });
                 }
-              } catch (err) {
-                this.log("warn", "failed to copy arm output to artifacts dir", {
-                  arm_id: grip.assigned_arm_id,
-                  grip_id: grip.grip_id,
-                  error: err instanceof Error ? err.message : String(err),
-                });
+              }
+
+              // Copy manifest-listed files (Bug 3 filesystem capture).
+              if (hasManifest) {
+                try {
+                  const manifest = readFileSync(touchedPath, "utf8");
+                  const files = manifest
+                    .split("\n")
+                    .map((l) => l.trim())
+                    .filter((l) => l.length > 0);
+                  let filesCopied = 0;
+                  for (const absSrc of files) {
+                    try {
+                      if (!existsSync(absSrc)) {
+                        continue;
+                      }
+                      // Flatten to a single level under gripSubdir
+                      // using the basename — good enough for
+                      // Phase 1. Future: preserve relative paths
+                      // below spec.cwd so directory trees survive.
+                      const baseName = path.basename(absSrc);
+                      const manifestDst = path.join(gripSubdir, baseName);
+                      copyFileSync(absSrc, manifestDst);
+                      filesCopied++;
+                      copiedCount++;
+                      // If this grip is the canonical output and
+                      // nothing else set outputArtifactPath yet, use
+                      // the first manifest file we copy.
+                      if (!outputArtifactPath && grip === allGrips[0]) {
+                        outputArtifactPath = manifestDst;
+                      }
+                    } catch (err) {
+                      copyErrors++;
+                      this.log("warn", "artifact promotion: manifest file copy failed", {
+                        arm_id: grip.assigned_arm_id,
+                        src: absSrc,
+                        error: err instanceof Error ? err.message : String(err),
+                      });
+                    }
+                  }
+                  this.log("info", "artifact promotion: manifest processed", {
+                    grip_id: grip.grip_id,
+                    arm_id: grip.assigned_arm_id,
+                    files_total: files.length,
+                    files_copied: filesCopied,
+                    tee_copied: teeCopied,
+                  });
+                } catch (err) {
+                  copyErrors++;
+                  this.log("warn", "artifact promotion: manifest read failed", {
+                    arm_id: grip.assigned_arm_id,
+                    manifest: touchedPath,
+                    error: err instanceof Error ? err.message : String(err),
+                  });
+                }
               }
             }
+
+            this.log("info", "mission artifact promotion: done", {
+              mission_id: mission.mission_id,
+              copied_count: copiedCount,
+              skipped_no_arm: skippedNoArm,
+              skipped_no_src: skippedNoSrc,
+              copy_errors: copyErrors,
+              output_artifact_path: outputArtifactPath ?? "(null)",
+            });
 
             const missionNext = applyMissionTransition(
               { state: mission.status, updated_at: mission.updated_at },
