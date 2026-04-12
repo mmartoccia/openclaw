@@ -247,3 +247,38 @@ CREATE INDEX IF NOT EXISTS idx_artifacts_mission_id    ON artifacts(mission_id);
 CREATE INDEX IF NOT EXISTS idx_artifacts_grip_id       ON artifacts(grip_id);
 CREATE INDEX IF NOT EXISTS idx_artifacts_arm_id        ON artifacts(arm_id);
 CREATE INDEX IF NOT EXISTS idx_artifacts_artifact_type ON artifacts(artifact_type);
+
+-- -----------------------------------------------------------------------------
+-- elo_ratings — aggregate Elo rating per runtime (one row per runtime_name)
+-- -----------------------------------------------------------------------------
+-- Populated by EloService when competitive missions finish. The rating
+-- starts at 1500 and is updated via pairwise Elo K=32 each time a game
+-- is recorded. Wins/losses/ties are cumulative counters for display in
+-- `openclaw octo elo` and the /octo chat command.
+CREATE TABLE IF NOT EXISTS elo_ratings (
+  runtime_name  TEXT PRIMARY KEY NOT NULL,
+  rating        REAL NOT NULL DEFAULT 1500.0,
+  games         INTEGER NOT NULL DEFAULT 0,
+  wins          INTEGER NOT NULL DEFAULT 0,
+  losses        INTEGER NOT NULL DEFAULT 0,
+  ties          INTEGER NOT NULL DEFAULT 0,
+  last_updated  INTEGER NOT NULL
+);
+
+-- -----------------------------------------------------------------------------
+-- elo_games — audit log of every recorded game
+-- -----------------------------------------------------------------------------
+-- One row per competitive mission outcome. `results_json` stores the
+-- pre/post rating snapshot so future tooling can replay history without
+-- re-parsing verdict artifacts.
+CREATE TABLE IF NOT EXISTS elo_games (
+  game_id         TEXT PRIMARY KEY NOT NULL,
+  mission_id      TEXT NOT NULL,
+  grip_id         TEXT NOT NULL,
+  winner_runtime  TEXT,
+  results_json    TEXT NOT NULL,
+  created_at      INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_elo_games_mission_id ON elo_games(mission_id);
+CREATE INDEX IF NOT EXISTS idx_elo_games_created_at ON elo_games(created_at);

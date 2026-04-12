@@ -22,7 +22,13 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import type { ArmSpec } from "../wire/schema.ts";
-import { AdapterError, type Adapter, type SessionRef, type AdapterEvent } from "./base.ts";
+import {
+  AdapterError,
+  type Adapter,
+  type AdapterEvent,
+  type CheckpointMeta,
+  type SessionRef,
+} from "./base.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -41,6 +47,8 @@ export interface RemoteNodeConfig {
   sentinelDir?: string;
   /** Poll interval for remote sentinel check (ms). Defaults to 2000. */
   pollIntervalMs?: number;
+  /** Maximum concurrent arms allowed on this node (0/undefined = unlimited). */
+  maxConcurrentArms?: number;
 }
 
 export interface RemotePtyTmuxAdapterOptions {
@@ -110,7 +118,7 @@ export class RemotePtyTmuxAdapter implements Adapter {
     const targetNodeId = spec.labels?.target_node ?? spec.env?.OCTO_TARGET_NODE;
     if (!targetNodeId) {
       throw new AdapterError(
-        "invalid_spec",
+        "spawn_failed",
         "remote_pty_tmux: spec.labels.target_node or env.OCTO_TARGET_NODE required",
       );
     }
@@ -118,7 +126,7 @@ export class RemotePtyTmuxAdapter implements Adapter {
     const node = this.remoteNodes.get(targetNodeId);
     if (!node) {
       throw new AdapterError(
-        "not_found",
+        "spawn_failed",
         `remote_pty_tmux: unknown node "${targetNodeId}". Known: ${[...this.remoteNodes.keys()].join(", ")}`,
       );
     }
@@ -235,15 +243,15 @@ export class RemotePtyTmuxAdapter implements Adapter {
     return "unknown";
   }
 
-  async terminate(ref: SessionRef): Promise<boolean> {
+  async terminate(ref: SessionRef): Promise<void> {
     const meta = ref.metadata as Record<string, string> | undefined;
     const nodeId = meta?.remote_node;
     if (!nodeId) {
-      return false;
+      return;
     }
     const node = this.remoteNodes.get(nodeId);
     if (!node) {
-      return false;
+      return;
     }
 
     try {
@@ -253,9 +261,8 @@ export class RemotePtyTmuxAdapter implements Adapter {
         clearInterval(poller);
         this.activePollers.delete(ref.session_id);
       }
-      return true;
     } catch {
-      return false;
+      // Best effort — remote termination is fire-and-forget.
     }
   }
 
@@ -275,8 +282,8 @@ export class RemotePtyTmuxAdapter implements Adapter {
     return ref;
   }
   async send(_ref: SessionRef, _input: string): Promise<void> {}
-  async checkpoint(_ref: SessionRef): Promise<Record<string, unknown>> {
-    return {};
+  async checkpoint(_ref: SessionRef): Promise<CheckpointMeta> {
+    return { ts: Date.now(), alive: false };
   }
   async *stream(_ref: SessionRef, _signal?: AbortSignal): AsyncGenerator<AdapterEvent> {}
 }
