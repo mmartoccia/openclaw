@@ -219,14 +219,37 @@ describe("sendTurn", () => {
     expect(args).toContain("5727573728");
     expect(args).toContain("--channel");
     expect(args).toContain("telegram");
-    expect(args).toContain("--deliver");
+    // --deliver is deliberately NOT passed: the agent runs and returns
+    // the reply via JSON stdout out-of-band, and meet.ts reposts the
+    // reply wrapped in a symmetric reverse-direction speaker frame
+    // via message send. If --deliver were passed here, the agent
+    // would auto-post the bare reply and we'd get two copies of the
+    // reply in the channel (one bare, one framed).
+    expect(args).not.toContain("--deliver");
     // Message should be frame-wrapped with the correct direction:
     // picker-up (claude-code) speaking to the dialer (openclaw-main).
+    // Per-agent icons: claude-code=🦾, openclaw-main=🦀 (see AGENT_ICONS
+    // in meet.ts). Each agent identity has a stable visual marker so
+    // adjacent turns from different agents are visually distinct in
+    // the channel surface.
     const msgIdx = args.indexOf("--message");
     const framedBody = args[msgIdx + 1];
-    expect(framedBody).toContain("🤖 → 🦾");
-    expect(framedBody).toContain("*claude-code → openclaw-main*");
+    expect(framedBody).toContain("🦾 *claude-code*");
+    expect(framedBody).toContain("🦀 *openclaw-main*");
     expect(framedBody).toContain("Hello, one question about X");
+    // Body and reply each get their own explicit message send call
+    // (body via STEP 1, reply reframe via STEP 3). Verify both fired.
+    expect(runMessageSend).toHaveBeenCalledTimes(2);
+    const bodySendArgs = runMessageSend.mock.calls[0][0] as string[];
+    expect(bodySendArgs).toContain("message");
+    expect(bodySendArgs).toContain("send");
+    const bodyMsgIdx = bodySendArgs.indexOf("--message");
+    expect(bodySendArgs[bodyMsgIdx + 1]).toContain("🦾 *claude-code*");
+    const replySendArgs = runMessageSend.mock.calls[1][0] as string[];
+    const replyMsgIdx = replySendArgs.indexOf("--message");
+    // Reply frame has reversed direction: listener → from.
+    expect(replySendArgs[replyMsgIdx + 1]).toContain("🦀 *openclaw-main*");
+    expect(replySendArgs[replyMsgIdx + 1]).toContain("ok from mock");
     // Reply extracted from mock JSON
     expect(result.replyText).toBe("ok from mock");
     // Transcript bumped, listener correctly set to the dialer

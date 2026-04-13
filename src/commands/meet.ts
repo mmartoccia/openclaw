@@ -234,6 +234,38 @@ function moveMeeting(
 
 const HR = "━━━━━━━━━━━━━━━━━━━━━";
 
+/**
+ * Stable per-agent icon registry. Distinct icons per identity make it
+ * obvious at a glance who is speaking in a mixed chat view — before
+ * this, every frame defaulted to 🤖 → 🦾 regardless of which agents
+ * were on the turn, so consecutive turns from different agent pairs
+ * all looked identical in Telegram.
+ *
+ * Additions: add an entry here when introducing a new agent identity
+ * to the meet protocol. Keep icons visually distinct — the whole point
+ * is that two adjacent turns from different agents are instantly
+ * distinguishable without reading the names.
+ */
+const AGENT_ICONS: Record<string, string> = {
+  "claude-code": "🦾",
+  claude: "🦾",
+  "openclaw-main": "🦀",
+  openclaw: "🦀",
+  main: "🦀",
+  "meet-doctor": "🩺",
+  "meet-doctor-target": "⚕️",
+};
+
+/**
+ * Return a stable icon for the given agent identity. Falls back to a
+ * generic robot for unknown agents so nothing blows up if a frame is
+ * rendered before the registry is updated.
+ */
+function agentIcon(agent: string): string {
+  const normalized = agent.trim().toLowerCase();
+  return AGENT_ICONS[normalized] ?? "🤖";
+}
+
 function openFrame(m: MeetingFile, initiatorIcon: string, targetIcon: string): string {
   return [
     `🎤 *MEETING OPENED*`,
@@ -252,7 +284,7 @@ function speakerFrame(
   fromIcon: string,
   toIcon: string,
 ): string {
-  return [`${fromIcon} → ${toIcon} *${from} → ${to}*`, HR, body, HR].join("\n");
+  return [`${fromIcon} *${from}* → ${toIcon} *${to}*`, HR, body, HR].join("\n");
 }
 
 function wrapFrame(m: MeetingFile): string {
@@ -417,8 +449,6 @@ export async function sendTurn(deps: MeetDeps, opts: SendOptions): Promise<SendR
 
   const meeting = readMeeting(found.path);
   const fromAgent = opts.from ?? meeting.picked_up_by ?? "claude-code";
-  const fromIcon = opts.fromIcon ?? "🤖";
-  const toIcon = opts.toIcon ?? "🦾";
   // Who the message is addressed to depends on who's speaking. If the
   // sender matches the meeting's dialer (`from_agent`), they're
   // talking to the target (`to_agent`). If the sender is the picker-up
@@ -426,6 +456,13 @@ export async function sendTurn(deps: MeetDeps, opts: SendOptions): Promise<SendR
   // same `meet send` verb handle both directions of a 1:1 meeting
   // without callers having to compute the recipient manually.
   const listenerAgent = fromAgent === meeting.from_agent ? meeting.to_agent : meeting.from_agent;
+  // Icons: derive from the agent registry so each identity gets its
+  // own visual marker. Explicit opts.fromIcon/opts.toIcon still win if
+  // passed — used by tests and by callers that want to override for
+  // one specific turn. Default is agentIcon(<name>) which produces
+  // stable per-identity icons (claude-code 🦾, openclaw-main 🦀, etc).
+  const fromIcon = opts.fromIcon ?? agentIcon(fromAgent);
+  const toIcon = opts.toIcon ?? agentIcon(listenerAgent);
 
   // Parse reply_via (e.g., "telegram:5727573728") into channel + chat.
   const [channel, chatId] = (meeting.reply_via ?? "").split(":");
@@ -478,17 +515,28 @@ export async function sendTurn(deps: MeetDeps, opts: SendOptions): Promise<SendR
     );
   }
 
-  // STEP 2 — Run the agent turn. The agent will receive the body as
-  // input (via its own session ingest path, separate from the body
-  // we just posted above), generate a reply, and post the reply to
-  // the channel.
+  // STEP 2 — Run the agent turn WITHOUT --deliver. The agent reads
+  // the framed body as input, generates a reply, and returns the
+  // reply out-of-band via JSON stdout. We deliberately omit --deliver
+  // so the agent does NOT auto-post the bare reply to the channel —
+  // that would duplicate content because STEP 3 below explicitly
+  // reposts the reply wrapped in its own reverse-direction speaker
+  // frame (🦀 openclaw-main → 🦾 claude-code for a claude-code →
+  // openclaw-main turn). This gives symmetric framing on both halves
+  // of every turn, so the operator can see at a glance which side of
+  // the conversation any bubble belongs to.
+  //
+  // Verified 2026-04-12: `openclaw agent --to X --message Y --json`
+  // (no --deliver) runs the agent, returns the reply in
+  // result.meta.finalAssistantVisibleText, and does NOT post to the
+  // channel. Confirmed by zero new outbound transcript entries after
+  // the probe call.
   const args = [
     "agent",
     "--to",
     chatId,
     "--channel",
     channel,
-    "--deliver",
     "--json",
     "--timeout",
     "180",
@@ -510,6 +558,36 @@ export async function sendTurn(deps: MeetDeps, opts: SendOptions): Promise<SendR
     // Non-JSON output — capture raw stdout as the reply so we still
     // record something in the transcript.
     replyText = stdout.slice(0, 4000);
+  }
+
+  // STEP 3 — Post the framed reply back to the channel with the
+  // reverse direction (listener → from). Agents' raw replies are
+  // text-only; by wrapping them in a symmetric speaker frame we give
+  // the operator the same visual marker for every message in the
+  // channel, not just the bodies we post. Only applied when --raw is
+  // false and we actually captured a non-empty reply. Best-effort:
+  // if the reframe-post fails, the reply is still in the meeting
+  // JSON transcript and the agent's original inference output lives
+  // in the agent session log, so no data is lost — only the symmetric
+  // Telegram visibility is missed.
+  if (!opts.raw && replyText.trim().length > 0) {
+    const framedReply = speakerFrame(listenerAgent, fromAgent, replyText, toIcon, fromIcon);
+    try {
+      await deps.runMessageSend([
+        "message",
+        "send",
+        "--target",
+        chatId,
+        "--channel",
+        channel,
+        "--message",
+        framedReply,
+      ]);
+    } catch (err) {
+      process.stderr.write(
+        `meet send: reply reframe-post failed (reply still in meeting JSON): ${err instanceof Error ? err.message : String(err)}\n`,
+      );
+    }
   }
 
   // Append to transcript + bump turn counter.
@@ -675,16 +753,22 @@ export function showMeeting(deps: MeetDeps, meetingId: string): MeetingFile {
  * live meeting.
  */
 export function renderTranscript(meeting: MeetingFile): string {
-  const initiatorIcon = "🤖";
-  const targetIcon = "🦾";
+  const initiatorIcon = agentIcon(meeting.from_agent);
+  const targetIcon = agentIcon(meeting.to_agent);
   const lines: string[] = [openFrame(meeting, initiatorIcon, targetIcon), ""];
   if (meeting.context.trim()) {
     lines.push(`*Context:* ${meeting.context}`, "");
   }
   for (const turn of meeting.transcript ?? []) {
-    lines.push(speakerFrame(turn.from, turn.to, turn.body, initiatorIcon, targetIcon));
+    // Each turn has its own from/to, so resolve icons per turn from
+    // the registry — handles turns where the from/to differ from the
+    // meeting-level initiator/target (e.g. the picker-up replies back
+    // to the dialer).
+    const turnFromIcon = agentIcon(turn.from);
+    const turnToIcon = agentIcon(turn.to);
+    lines.push(speakerFrame(turn.from, turn.to, turn.body, turnFromIcon, turnToIcon));
     if (turn.reply) {
-      lines.push("", speakerFrame(turn.to, turn.from, turn.reply, targetIcon, initiatorIcon));
+      lines.push("", speakerFrame(turn.to, turn.from, turn.reply, turnToIcon, turnFromIcon));
     }
     lines.push("");
   }
