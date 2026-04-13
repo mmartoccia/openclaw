@@ -14,6 +14,7 @@ import {
   dialMeeting,
   doctorMeet,
   formatDoctorResult,
+  inviteGuest,
   listMeetings,
   pickupMeeting,
   renderTranscript,
@@ -217,6 +218,86 @@ ${formatHelpExamples([
           ].join("\n"),
           false,
         );
+      }
+    });
+
+  // ── invite ───────────────────────────────────────────────────────────
+  //
+  // Host/guest primitive. The host session (whatever inference model
+  // is serving the current chat) brings in a guest CLI or API for a
+  // single-turn contribution. The guest spawns as a subprocess,
+  // responds, and disappears. Both halves land in the communication
+  // plane (meeting.reply_via channel) so the operator sees the full
+  // interaction inline.
+  meet
+    .command("invite")
+    .description(
+      "Invite a guest (e.g. claude-code, codex, gemini) into an active meeting for a single-turn contribution",
+    )
+    .requiredOption(
+      "--guest <id>",
+      "Registered guest id (e.g. claude-code, codex, gemini, qwen-local). See ~/.openclaw/config/meet-guests.yaml",
+    )
+    .requiredOption("--prompt <text>", "The question or task to ask the guest")
+    .option(
+      "--meeting <id>",
+      "Active meeting id to inject into (omit with --create for ephemeral meetings)",
+    )
+    .option(
+      "--create",
+      "Create a fresh ephemeral meeting for this one-shot invite (requires --topic and --reply-via)",
+      false,
+    )
+    .option("--topic <text>", "Topic for ephemeral meetings (required when --create is set)")
+    .option(
+      "--reply-via <channel:chat>",
+      "Communication plane override (required for --create, default: inherit from meeting)",
+    )
+    .option(
+      "--context-depth <n>",
+      "How many prior turns from the meeting transcript to include in the guest prompt (default: 3)",
+      "3",
+    )
+    .option(
+      "--timeout <seconds>",
+      "Guest invocation timeout in seconds (default: guest-specific, usually 180)",
+    )
+    .option("--from <agent>", "Host agent id (defaults to $OPENCLAW_AGENT_ID or errors if unset)")
+    .option("--json", "Output JSON instead of human-readable", false)
+    .action(async (opts) => {
+      try {
+        const result = await inviteGuest(deps, {
+          meeting: stringOrUndef(opts.meeting),
+          create: Boolean(opts.create),
+          guest: String(opts.guest),
+          prompt: String(opts.prompt),
+          topic: stringOrUndef(opts.topic),
+          replyVia: stringOrUndef(opts.replyVia),
+          contextDepth: opts.contextDepth ? parseInt(String(opts.contextDepth), 10) : undefined,
+          timeout: opts.timeout ? parseInt(String(opts.timeout), 10) : undefined,
+          from: stringOrUndef(opts.from),
+        });
+        if (opts.json) {
+          emit(result, true);
+        } else {
+          emit(
+            [
+              `invited:  ${result.guest}`,
+              `meeting:  ${result.meeting_id}${result.ephemeral ? " (ephemeral)" : ""}`,
+              `latency:  ${result.latency_ms}ms`,
+              `delivered to channel: ${result.frame_delivered ? "yes" : "no"}`,
+              ``,
+              `--- guest response ---`,
+              result.response_text,
+            ].join("\n"),
+            false,
+          );
+        }
+      } catch (err) {
+        process.stderr.write(
+          `meet invite failed: ${err instanceof Error ? err.message : String(err)}\n`,
+        );
+        process.exit(1);
       }
     });
 
