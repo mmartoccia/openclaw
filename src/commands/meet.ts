@@ -464,7 +464,7 @@ export async function sendTurn(deps: MeetDeps, opts: SendOptions): Promise<SendR
   const fromIcon = opts.fromIcon ?? agentIcon(fromAgent);
   const toIcon = opts.toIcon ?? agentIcon(listenerAgent);
 
-  // Parse reply_via (e.g., "telegram:5727573728") into channel + chat.
+  // Parse reply_via (e.g., "telegram:1234567890") into channel + chat.
   const [channel, chatId] = (meeting.reply_via ?? "").split(":");
   if (!channel || !chatId) {
     throw new Error(

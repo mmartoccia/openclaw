@@ -58,7 +58,7 @@ export function registerMeetCommands(program: Command, deps: MeetDeps = defaultM
 ${theme.heading("Examples:")}
 ${formatHelpExamples([
   [
-    'openclaw meet dial --to claude-code --topic "sentinel polling review" --from openclaw-main --from-channel telegram --from-chat 5727573728',
+    'openclaw meet dial --to claude-code --topic "sentinel polling review" --from openclaw-main --from-channel telegram --from-chat 1234567890',
     "Request a meeting with claude-code; the file lands in ~/.openclaw/meetings/pending/",
   ],
   ["openclaw meet list --state pending", "Show pending meetings waiting for pickup."],

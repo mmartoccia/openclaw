@@ -90,14 +90,14 @@ describe("dialMeeting", () => {
       topic: "remote sentinel polling",
       from: "openclaw-main",
       fromChannel: "telegram",
-      fromChat: "5727573728",
+      fromChat: "1234567890",
     });
     expect(meeting.meeting_id).toMatch(/^mtg_\d+_[0-9a-f]{6}$/);
     expect(meeting.status).toBe("pending");
     expect(meeting.to_agent).toBe("claude-code");
     expect(meeting.topic).toBe("remote sentinel polling");
     expect(meeting.from_agent).toBe("openclaw-main");
-    expect(meeting.reply_via).toBe("telegram:5727573728");
+    expect(meeting.reply_via).toBe("telegram:1234567890");
     expect(meeting.created_at).toBe("2026-04-12T14:00:00Z");
     expect(filePath).toContain("/meetings/pending/");
     expect(existsSync(filePath)).toBe(true);
@@ -143,7 +143,7 @@ describe("pickupMeeting", () => {
       to: "claude-code",
       topic: "t",
       fromChannel: "telegram",
-      fromChat: "5727573728",
+      fromChat: "1234567890",
     });
     tick(1000);
     const result = pickupMeeting(deps, {
@@ -166,7 +166,7 @@ describe("pickupMeeting", () => {
       to: "claude-code",
       topic: "t",
       fromChannel: "telegram",
-      fromChat: "5727573728",
+      fromChat: "1234567890",
     });
     pickupMeeting(deps, { meeting: dialed.meeting_id });
     const second = pickupMeeting(deps, { meeting: dialed.meeting_id });
@@ -179,7 +179,7 @@ describe("pickupMeeting", () => {
       to: "claude-code",
       topic: "t",
       fromChannel: "telegram",
-      fromChat: "5727573728",
+      fromChat: "1234567890",
     });
     pickupMeeting(deps, { meeting: dialed.meeting_id });
     await wrapMeeting(deps, { meeting: dialed.meeting_id, silent: true });
@@ -205,7 +205,7 @@ describe("sendTurn", () => {
       to: "claude-code",
       topic: "t",
       fromChannel: "telegram",
-      fromChat: "5727573728",
+      fromChat: "1234567890",
     });
     pickupMeeting(deps, { meeting: dialed.meeting_id, pickedUpBy: "claude-code" });
     const result = await sendTurn(deps, {
@@ -216,7 +216,7 @@ describe("sendTurn", () => {
     const args = runAgentTurn.mock.calls[0][0] as string[];
     expect(args[0]).toBe("agent");
     expect(args).toContain("--to");
-    expect(args).toContain("5727573728");
+    expect(args).toContain("1234567890");
     expect(args).toContain("--channel");
     expect(args).toContain("telegram");
     // --deliver is deliberately NOT passed: the agent runs and returns
@@ -266,7 +266,7 @@ describe("sendTurn", () => {
       to: "openclaw-main",
       topic: "t",
       fromChannel: "telegram",
-      fromChat: "5727573728",
+      fromChat: "1234567890",
     });
     pickupMeeting(deps, { meeting: dialed.meeting_id });
     await sendTurn(deps, {
@@ -284,7 +284,7 @@ describe("sendTurn", () => {
       to: "openclaw-main",
       topic: "t",
       fromChannel: "telegram",
-      fromChat: "5727573728",
+      fromChat: "1234567890",
     });
     await expect(sendTurn(deps, { meeting: dialed.meeting_id, message: "hi" })).rejects.toThrow(
       /pick it up first/,
@@ -304,7 +304,7 @@ describe("sendTurn", () => {
       to: "openclaw-main",
       topic: "t",
       fromChannel: "telegram",
-      fromChat: "5727573728",
+      fromChat: "1234567890",
     });
     pickupMeeting(deps, { meeting: dialed.meeting_id });
     await sendTurn(deps, { meeting: dialed.meeting_id, message: "turn 1" });
@@ -322,7 +322,7 @@ describe("sendTurn", () => {
       to: "openclaw-main",
       topic: "t",
       fromChannel: "telegram",
-      fromChat: "5727573728",
+      fromChat: "1234567890",
     });
     pickupMeeting(deps, { meeting: dialed.meeting_id });
     runAgentTurn.mockResolvedValueOnce({ stdout: "plain non-json output", stderr: "" });
@@ -341,7 +341,7 @@ describe("wrapMeeting", () => {
       to: "openclaw-main",
       topic: "t",
       fromChannel: "telegram",
-      fromChat: "5727573728",
+      fromChat: "1234567890",
     });
     pickupMeeting(deps, { meeting: dialed.meeting_id });
     tick(10_000);
@@ -360,7 +360,7 @@ describe("wrapMeeting", () => {
       to: "openclaw-main",
       topic: "t",
       fromChannel: "telegram",
-      fromChat: "5727573728",
+      fromChat: "1234567890",
     });
     pickupMeeting(deps, { meeting: dialed.meeting_id });
     await wrapMeeting(deps, { meeting: dialed.meeting_id, outcome: "done" });
@@ -377,7 +377,7 @@ describe("wrapMeeting", () => {
       to: "openclaw-main",
       topic: "t",
       fromChannel: "telegram",
-      fromChat: "5727573728",
+      fromChat: "1234567890",
     });
     pickupMeeting(deps, { meeting: dialed.meeting_id });
     await wrapMeeting(deps, { meeting: dialed.meeting_id, silent: true });
