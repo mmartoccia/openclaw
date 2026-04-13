@@ -26,7 +26,7 @@
 #   --from-chat <id>      Caller's chat_id (default: none)
 #   --reply-via <spec>    How the caller wants the reply routed back
 #                         (default: same as from-channel:from-chat, e.g.
-#                         "telegram:5727573728")
+#                         "telegram:1234567890")
 #   --no-notify           Skip the macOS notification (useful for tests)
 #   --quiet               Don't print to stdout (only the meeting_id)
 #

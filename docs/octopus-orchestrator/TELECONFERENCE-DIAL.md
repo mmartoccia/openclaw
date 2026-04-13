@@ -75,11 +75,11 @@ A pending meeting is a plain JSON file at `~/.openclaw/meetings/pending/<meeting
   "meeting_id": "mtg_1776002260868_abfb34",
   "from_agent": "openclaw-main",
   "from_channel": "telegram",
-  "from_chat_id": "5727573728",
+  "from_chat_id": "1234567890",
   "to_agent": "claude-code",
   "topic": "remote sentinel polling — is it still racy under load?",
   "context": "I noticed an edge case when 3 arms complete within 50ms",
-  "reply_via": "telegram:5727573728",
+  "reply_via": "telegram:1234567890",
   "created_at": "2026-04-12T13:57:40Z",
   "status": "pending"
 }
@@ -122,7 +122,7 @@ Writes the JSON file, dispatches a macOS notification via `osascript`. Exits 0 o
   --topic "$USER_SUPPLIED_TOPIC" \
   --from openclaw-main \
   --from-channel telegram \
-  --from-chat 5727573728
+  --from-chat 1234567890
 ```
 
 ### `meet-check.sh` — list meetings

@@ -185,15 +185,15 @@ All of this works today via the raw `agent --to --deliver` path. The PR is about
 
 ```bash
 # Send a visible outbound (posts from bot, no agent turn triggered)
-openclaw message send --channel telegram --target 5727573728 \
+openclaw message send --channel telegram --target 1234567890 \
   --message "[claude-code→openclaw] ..."
 
 # Send an actionable turn (posts both sides via --deliver, triggers agent turn)
-openclaw agent --to 5727573728 --channel telegram --deliver --timeout 180 \
+openclaw agent --to 1234567890 --channel telegram --deliver --timeout 180 \
   --message "[claude-code→openclaw] ..."
 
 # Read reply from JSON (no --deliver needed for programmatic use)
-openclaw agent --to 5727573728 --channel telegram --json --timeout 180 \
+openclaw agent --to 1234567890 --channel telegram --json --timeout 180 \
   --message "..." | jq -r '.result.meta.finalAssistantVisibleText'
 ```
 

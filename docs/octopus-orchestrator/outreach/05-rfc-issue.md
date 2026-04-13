@@ -127,7 +127,7 @@ meeting back, via a file-inbox primitive at
 executed `meet-dial.sh --to claude-code --topic "dial protocol
 onboarding test"`, the pending file landed, the Claude Code session
 picked it up, moved it to `active/`, responded via `reply_via:
-telegram:5727573728` (captured from the dial request), ran one
+telegram:1234567890` (captured from the dial request), ran one
 exchange, and moved the file to `closed/` on wrap. Bidirectional
 round-trip proven end-to-end.
 
@@ -177,11 +177,11 @@ openclaw agent teleconference transcript \
   "meeting_id": "mtg_01HXXXX",
   "from_agent": "openclaw-main",
   "from_channel": "telegram",
-  "from_chat_id": "5727573728",
+  "from_chat_id": "1234567890",
   "to_agent": "claude-code",
   "topic": "remote sentinel polling under load",
   "context": "optional longer context",
-  "reply_via": "telegram:5727573728",
+  "reply_via": "telegram:1234567890",
   "created_at": "2026-04-12T13:57:40Z",
   "started_at": "2026-04-12T13:58:12Z",
   "ended_at": "2026-04-12T14:03:01Z",
