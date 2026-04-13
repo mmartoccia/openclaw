@@ -2672,9 +2672,13 @@ describe("gateway server sessions", () => {
       },
     );
     expect(threadBindingMocks.unbindThreadBindingsBySessionKey).toHaveBeenCalledTimes(1);
+    // preserveBindings: true is passed by session-reset so adapters
+    // that honor the flag (Telegram, generic current-conversation)
+    // survive a context-reset. See 2026-04-13 grid chat fix.
     expect(threadBindingMocks.unbindThreadBindingsBySessionKey).toHaveBeenCalledWith({
       targetSessionKey: "agent:main:main",
       reason: "session-reset",
+      preserveBindings: true,
     });
 
     ws.close();
@@ -2881,6 +2885,7 @@ describe("gateway server sessions", () => {
     expect(threadBindingMocks.unbindThreadBindingsBySessionKey).toHaveBeenCalledWith({
       targetSessionKey: "agent:main:subagent:worker",
       reason: "session-reset",
+      preserveBindings: true,
     });
 
     ws.close();
@@ -2909,6 +2914,7 @@ describe("gateway server sessions", () => {
     expect(threadBindingMocks.unbindThreadBindingsBySessionKey).toHaveBeenCalledWith({
       targetSessionKey: "agent:main:main",
       reason: "session-reset",
+      preserveBindings: true,
     });
 
     ws.close();

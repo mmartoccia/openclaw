@@ -202,11 +202,24 @@ export async function emitSessionUnboundLifecycleEvent(params: {
   targetSessionKey: string;
   reason: "session-reset" | "session-delete";
   emitHooks?: boolean;
+  /**
+   * When true, adapters that honor this flag preserve their bindings
+   * instead of removing them. Used by the context-reset flow at
+   * performGatewaySessionReset so Telegram thread bindings survive a
+   * reset and routing doesn't fall back to the default agent (whose
+   * allowlist may reject the group). Default false preserves the
+   * pre-2026-04-13 behavior for all other callers.
+   *
+   * Not every adapter honors this — Discord and most channels keep
+   * unbinding unconditionally. See SessionBindingUnbindInput.
+   */
+  preserveBindings?: boolean;
 }) {
   const targetKind = isSubagentSessionKey(params.targetSessionKey) ? "subagent" : "acp";
   await getSessionBindingService().unbind({
     targetSessionKey: params.targetSessionKey,
     reason: params.reason,
+    preserveBindings: params.preserveBindings,
   });
 
   if (params.emitHooks === false) {
@@ -693,9 +706,16 @@ export async function performGatewaySessionReset(params: {
     resumedFrom: oldSessionId,
   });
   if (hadExistingEntry) {
+    // preserveBindings: true so Telegram thread bindings survive a
+    // context-reset and the next inbound message keeps routing to the
+    // same agent. Without this, the fallback to resolveAgentRoute →
+    // default agent produces "This group is not allowed" when the
+    // default agent's allowlist doesn't include the chat.
+    // Discord and other adapters ignore this flag and keep unbinding.
     await emitSessionUnboundLifecycleEvent({
       targetSessionKey: target.canonicalKey ?? params.key,
       reason: "session-reset",
+      preserveBindings: true,
     });
   }
   return { ok: true, key: target.canonicalKey, entry: next };

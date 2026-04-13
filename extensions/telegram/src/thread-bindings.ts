@@ -690,6 +690,14 @@ export function createTelegramThreadBindingManager(
       manager.touchConversation(conversationId, at);
     },
     unbind: async (input) => {
+      // Honor preserveBindings from the reset flow so thread bindings
+      // survive a context-reset. See session-reset-service.ts and the
+      // 2026-04-13 "grid chat frozen" bug write-up. Without this, a
+      // post-reset message falls through to resolveAgentRoute → default
+      // agent, whose allowlist rejects the group.
+      if (input.preserveBindings) {
+        return [];
+      }
       if (input.targetSessionKey?.trim()) {
         const removed = manager.unbindBySessionKey({
           targetSessionKey: input.targetSessionKey,

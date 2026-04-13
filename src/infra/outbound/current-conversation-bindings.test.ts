@@ -299,6 +299,39 @@ describe("generic current-conversation bindings", () => {
     ).toBeNull();
   });
 
+  // Regression test for the 2026-04-13 "grid chat frozen" fix: the
+  // generic current-conversation binding must survive a session-reset
+  // so that the first post-reset reply still knows where to go.
+  // preserveBindings=true → no-op. TTL / sweep still clean stale entries.
+  it("honors preserveBindings=true — leaves records in place", async () => {
+    await bindGenericCurrentConversation({
+      targetSessionKey: "agent:codex:acp:preserve-room",
+      targetKind: "session",
+      conversation: {
+        channel: "googlechat",
+        accountId: "default",
+        conversationId: "spaces/PRESERVE",
+      },
+    });
+
+    const removed = await unbindGenericCurrentConversationBindings({
+      targetSessionKey: "agent:codex:acp:preserve-room",
+      reason: "session-reset",
+      preserveBindings: true,
+    });
+
+    expect(removed).toEqual([]);
+
+    // The binding should still resolve after the preserved unbind call.
+    expect(
+      resolveGenericCurrentConversationBinding({
+        channel: "googlechat",
+        accountId: "default",
+        conversationId: "spaces/PRESERVE",
+      }),
+    ).not.toBeNull();
+  });
+
   it("persists touched activity across reloads", async () => {
     const bound = await bindGenericCurrentConversation({
       targetSessionKey: "agent:codex:acp:slack-dm",

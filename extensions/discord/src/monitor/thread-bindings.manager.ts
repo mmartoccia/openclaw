@@ -690,6 +690,17 @@ export function createThreadBindingManager(
       manager.touchThread({ threadId, at, persist: true });
     },
     unbind: async (input) => {
+      // NOTE (2026-04-13): `input.preserveBindings` is intentionally
+      // NOT honored here. The Telegram adapter and the generic
+      // current-conversation binding honor it so session-reset
+      // preserves routing (see extensions/telegram/src/thread-bindings.ts
+      // and src/infra/outbound/current-conversation-bindings.ts), but
+      // Discord's unbind path has user-visible side effects (farewell
+      // messages to the channel via unbindThread → maybeSendBindingMessage)
+      // that the f6124f3e17 "harden Discord recovery and reset flow"
+      // commit relies on. Extending preserveBindings to Discord must be
+      // discussed with the channel owner and paired with explicit tests
+      // of the recovery path — do not silently add `if (input.preserveBindings)`.
       if (input.targetSessionKey?.trim()) {
         const removed = manager.unbindBySessionKey({
           targetSessionKey: input.targetSessionKey,

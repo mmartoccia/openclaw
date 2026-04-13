@@ -37,6 +37,18 @@ export type SessionBindingUnbindInput = {
   bindingId?: string;
   targetSessionKey?: string;
   reason: string;
+  /**
+   * When true, adapters that understand this flag should treat the
+   * unbind request as a no-op and leave their records in place. Used
+   * by session-reset (as opposed to session-delete) so that routing
+   * survives a context-reset flow where the session key is reused.
+   *
+   * Adapters are NOT required to honor this — each one opts in.
+   * As of 2026-04-13: Telegram and the generic current-conversation
+   * binding honor it; Discord and other channels ignore it and keep
+   * their existing behavior (including Discord's farewell post).
+   */
+  preserveBindings?: boolean;
 };
 
 export type SessionBindingCapabilities = {

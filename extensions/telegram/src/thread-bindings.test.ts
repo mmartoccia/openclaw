@@ -372,4 +372,70 @@ describe("telegram thread bindings", () => {
       process.off("unhandledRejection", onUnhandledRejection);
     }
   });
+
+  // Regression tests for the 2026-04-13 "grid chat frozen" bug.
+  // Root cause: session-reset-service.ts called unbind unconditionally,
+  // causing post-reset messages to reroute to the default agent whose
+  // allowlist didn't include the group, producing "This group is not
+  // allowed". Fix: session-reset now passes preserveBindings: true, and
+  // the Telegram adapter early-returns when it sees that flag. These
+  // tests pin that behavior so a future refactor can't silently
+  // reintroduce the bug.
+
+  it("honors preserveBindings=true — keeps records on session-reset", async () => {
+    const manager = createTelegramThreadBindingManager({
+      accountId: "preserve",
+      persist: false,
+      enableSweeper: false,
+    });
+
+    await getSessionBindingService().bind({
+      targetSessionKey: "agent:main:subagent:preserve-1",
+      targetKind: "subagent",
+      conversation: {
+        channel: "telegram",
+        accountId: "preserve",
+        conversationId: "-100200300:topic:123",
+      },
+    });
+    expect(manager.getByConversationId("-100200300:topic:123")).toBeDefined();
+
+    // Simulate the reset flow — same shape emitSessionUnboundLifecycleEvent
+    // uses when called from performGatewaySessionReset.
+    await getSessionBindingService().unbind({
+      targetSessionKey: "agent:main:subagent:preserve-1",
+      reason: "session-reset",
+      preserveBindings: true,
+    });
+
+    // Binding must survive: this is the behavior that fixes the bug.
+    expect(manager.getByConversationId("-100200300:topic:123")).toBeDefined();
+  });
+
+  it("ignores preserveBindings on session-delete — still unbinds", async () => {
+    const manager = createTelegramThreadBindingManager({
+      accountId: "delete",
+      persist: false,
+      enableSweeper: false,
+    });
+
+    await getSessionBindingService().bind({
+      targetSessionKey: "agent:main:subagent:delete-1",
+      targetKind: "subagent",
+      conversation: {
+        channel: "telegram",
+        accountId: "delete",
+        conversationId: "-100200300:topic:456",
+      },
+    });
+    expect(manager.getByConversationId("-100200300:topic:456")).toBeDefined();
+
+    // session-delete path never sets preserveBindings → unbind fires normally.
+    await getSessionBindingService().unbind({
+      targetSessionKey: "agent:main:subagent:delete-1",
+      reason: "session-delete",
+    });
+
+    expect(manager.getByConversationId("-100200300:topic:456")).toBeUndefined();
+  });
 });

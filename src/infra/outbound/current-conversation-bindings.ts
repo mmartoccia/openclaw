@@ -229,6 +229,14 @@ export function touchGenericCurrentConversationBinding(bindingId: string, at = D
 export async function unbindGenericCurrentConversationBindings(
   input: SessionBindingUnbindInput,
 ): Promise<SessionBindingRecord[]> {
+  // Honor preserveBindings from the reset flow. The generic
+  // current-conversation binding is "reply goes back here" routing; if
+  // a session-reset nukes it, the first post-reset reply can't find a
+  // target. The sweep/TTL layer still prunes stale entries, so
+  // preserving across reset doesn't grow unbounded.
+  if (input.preserveBindings) {
+    return [];
+  }
   loadBindingsIntoMemory();
   const removed: SessionBindingRecord[] = [];
   const normalizedBindingId = input.bindingId?.trim();
