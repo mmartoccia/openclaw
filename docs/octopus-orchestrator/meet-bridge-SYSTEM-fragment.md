@@ -21,9 +21,9 @@ finds them unambiguously.
 ## Meet Bridge Contract (frozen 2026-04-12)
 
 Agent-to-agent teleconference uses the `openclaw meet` verbs. The
-**authoritative contract** lives at
-`/Users/michaelmartoccia/clawd/openclaw_repo-octopus/docs/octopus-orchestrator/MEET-BRIDGE-CONTRACT.md`.
-Read it before doing any agent-to-agent comms work.
+**authoritative contract** lives in the openclaw fork at
+`docs/octopus-orchestrator/MEET-BRIDGE-CONTRACT.md`. Read it before
+doing any agent-to-agent comms work.
 
 **Hard invariants — do not violate these:**
 

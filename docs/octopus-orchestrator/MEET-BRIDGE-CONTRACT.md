@@ -196,7 +196,7 @@ lifecycle transition bugs.
 ### Channel mode
 
 ```bash
-openclaw meet doctor --channel telegram --target 5727573728
+openclaw meet doctor --channel telegram --target <chat_id>
 ```
 
 Additionally runs a real meet send turn through the given channel,
@@ -267,7 +267,7 @@ the authoritative record of what main has actually said.
 
 ### When the bridge feels off
 
-1. Run `openclaw meet doctor --channel telegram --target 5727573728`
+1. Run `openclaw meet doctor --channel telegram --target <chat_id>`
 2. Read the named checks. The first failing one is the layer to
    investigate.
 3. If all checks pass but you're still seeing weird behavior, the
