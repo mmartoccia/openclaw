@@ -220,6 +220,14 @@ export function registerOctoCli(program: Command) {
       "Map runtime to remote node (e.g. codex=distiller-rpi5 gemini=distiller-rpi5). Unmapped runtimes run locally.",
     )
     .option("--prompt <text>", "Task prompt passed to each spawned CLI as initial_input")
+    .option(
+      "--grip-prompt <mappings...>",
+      "Per-grip prompt overrides as gripId=text (e.g. identity-match='task A'). Falls back to --prompt for grips without an override.",
+    )
+    .option(
+      "--input <files...>",
+      "Files to stage into the mission cwd's _inputs/ directory before launch. Each file is copied as _inputs/<basename>. The runtime can read them via relative path. Replaces the prior 'paste artifact path into prompt' workaround.",
+    )
     .option("--json", "Output as JSON")
     .action(async (opts) => {
       const { runMissionCreate } = await import("./mission.js");
@@ -234,6 +242,13 @@ export function registerOctoCli(program: Command) {
       interface RuntimeProfile {
         command: string;
         buildArgs: (prompt?: string) => string[];
+        // Whether this runtime canonically produces a filesystem
+        // artifact (claude-code edits files in cwd) or streams its
+        // deliverable to stdout (codex/gemini/aider). The wrapper
+        // and deliverable check use this to know where the result
+        // actually lives. See pty-tmux.ts wrapper and
+        // NodeAgent.handleProcessEvent.
+        outputModel: "filesystem" | "stdout";
       }
       // Pin minimum model versions for each runtime per the
       // 2026-04-12 working session: Claude → Sonnet 4.6, Codex →
@@ -254,6 +269,21 @@ export function registerOctoCli(program: Command) {
             ...(p ? [p] : []),
             "--dangerously-skip-permissions",
           ],
+          // Claude with `-p` (non-interactive) is a stdout-model
+          // invocation: the model's response streams to stdout, and
+          // file edits only happen when the prompt explicitly asks
+          // for them. The 2026-04-12 smoke test confirmed this — a
+          // prompt to "write 3 paragraphs" produced stdout content
+          // and zero file writes, which the deliverable check
+          // correctly flagged as completed_no_deliverable when
+          // claude was misclassified as filesystem-model. Treating
+          // it as stdout-model means the wrapper tees stdout into
+          // <cwd>/.octo/<arm-id>.stdout.md so prompts that write
+          // files AND prompts that only stream both produce a
+          // canonical deliverable. Manifest find-newer still
+          // captures any real file edits in addition to the stdout
+          // file.
+          outputModel: "stdout",
         },
         claude: {
           command: "claude",
@@ -264,6 +294,7 @@ export function registerOctoCli(program: Command) {
             ...(p ? [p] : []),
             "--dangerously-skip-permissions",
           ],
+          outputModel: "stdout",
         },
         codex: {
           command: "codex",
@@ -279,6 +310,7 @@ export function registerOctoCli(program: Command) {
             "--skip-git-repo-check",
             ...(p ? [p] : []),
           ],
+          outputModel: "stdout",
         },
         gemini: {
           command: "gemini",
@@ -290,10 +322,12 @@ export function registerOctoCli(program: Command) {
             "--approval-mode",
             "yolo",
           ],
+          outputModel: "stdout",
         },
         aider: {
           command: "aider",
           buildArgs: (p) => ["--yes", ...(p ? ["--message", p] : [])],
+          outputModel: "stdout",
         },
         // NOTE: there is intentionally no `openclaw` runtime profile.
         // A previous iteration added one that mapped to
@@ -334,6 +368,79 @@ export function registerOctoCli(program: Command) {
         }
       }
 
+      // Parse --grip-prompt mappings: "identity-match=task text"
+      // First '=' is the separator (so the prompt itself can contain '=').
+      const gripPromptMap = new Map<string, string>();
+      if (opts.gripPrompt) {
+        for (const mapping of opts.gripPrompt as string[]) {
+          const eq = mapping.indexOf("=");
+          if (eq <= 0 || eq >= mapping.length - 1) {
+            throw new Error(`Invalid --grip-prompt mapping (must be gripId=text): ${mapping}`);
+          }
+          const gripId = mapping.slice(0, eq);
+          const text = mapping.slice(eq + 1);
+          gripPromptMap.set(gripId, text);
+        }
+      }
+
+      // Stage --input files into _inputs/ before launch so round-1
+      // arms can read them by relative path. Same convention as the
+      // cascade dep-handoff. With per-grip cwd isolation (pass 1.5
+      // hotfix), each grip in a multi-grip mission gets its own
+      // <base>/<sanitized-grip-id>/_inputs/<basename>; the gateway
+      // expander uses the matching derivation when building per-grip
+      // arm templates. Single-grip missions stage into the base cwd
+      // directly. Idempotent: re-running with the same cwds overwrites
+      // prior staged files.
+      if (opts.input && opts.input.length > 0 && opts.armCwd) {
+        const fs = await import("node:fs");
+        const path = await import("node:path");
+        const sanitizeGripForCwd = (gripId: string): string =>
+          gripId.replace(/[^a-zA-Z0-9._-]/g, "_");
+        const grips: string[] = (opts.grip as string[] | undefined) ?? [];
+        // Determine target cwds — one per grip for multi-grip
+        // missions, single base cwd otherwise. Mirrors gateway
+        // expander logic in src/octo/wire/gateway-handlers.ts.
+        const targetCwds: string[] =
+          grips.length > 1
+            ? grips.map((g) => path.join(opts.armCwd as string, sanitizeGripForCwd(g)))
+            : [opts.armCwd as string];
+        for (const src of opts.input as string[]) {
+          if (!fs.existsSync(src)) {
+            throw new Error(`--input file not found: ${src}`);
+          }
+        }
+        for (const targetCwd of targetCwds) {
+          const inputsDir = path.join(targetCwd, "_inputs");
+          try {
+            fs.mkdirSync(inputsDir, { recursive: true });
+          } catch (err) {
+            throw new Error(
+              `Failed to create _inputs dir at ${inputsDir}: ${err instanceof Error ? err.message : String(err)}`,
+              { cause: err },
+            );
+          }
+          for (const src of opts.input as string[]) {
+            const base = path.basename(src);
+            const dst = path.join(inputsDir, base);
+            fs.copyFileSync(src, dst);
+          }
+        }
+      }
+
+      // Effective bake-in prompt for arm template construction.
+      // When --grip-prompt is set but --prompt is not, the runtime CLI
+      // (claude --print, codex exec, gemini -p) still needs SOMETHING
+      // in its args slot or it errors with "Input must be provided".
+      // Use the first grip's per-grip prompt as the bake-in so the
+      // gateway expander has a known string to find-and-replace when
+      // routing per-grip overrides for other grips. The first grip's
+      // own template will then match-skip (rewriteArgsForPrompt is
+      // a no-op when originalPrompt === framedPrompt).
+      const firstGripPrompt =
+        gripPromptMap.size > 0 ? gripPromptMap.values().next().value : undefined;
+      const bakedPrompt = opts.prompt ?? firstGripPrompt;
+
       let armTemplates: import("../wire/schema.js").ArmTemplate[] | undefined;
       if (opts.armTemplate && opts.armTemplate.length > 0) {
         armTemplates = opts.armTemplate.map((name: string) => {
@@ -351,7 +458,7 @@ export function registerOctoCli(program: Command) {
             runtime_name: name,
             agent_id: opts.owner ?? "main",
             cwd: effectiveCwd,
-            ...(opts.prompt ? { initial_input: opts.prompt } : {}),
+            ...(bakedPrompt ? { initial_input: bakedPrompt } : {}),
             ...(targetNode ? { labels: { target_node: targetNode } } : {}),
           };
           if (profile) {
@@ -359,7 +466,8 @@ export function registerOctoCli(program: Command) {
               ...base,
               runtime_options: {
                 command: profile.command,
-                args: profile.buildArgs(opts.prompt),
+                args: profile.buildArgs(bakedPrompt),
+                output_model: profile.outputModel,
               },
             };
           }
@@ -376,6 +484,9 @@ export function registerOctoCli(program: Command) {
         });
       }
 
+      const gripPromptsRecord =
+        gripPromptMap.size > 0 ? Object.fromEntries(gripPromptMap.entries()) : undefined;
+
       const code = await withHandlers(({ handlers }) =>
         runMissionCreate(handlers, {
           title: opts.title,
@@ -385,6 +496,7 @@ export function registerOctoCli(program: Command) {
           policyProfileRef: opts.policyProfile,
           executionMode: opts.executionMode,
           armTemplates,
+          gripPrompts: gripPromptsRecord,
           json: opts.json,
         }),
       );
@@ -399,6 +511,23 @@ export function registerOctoCli(program: Command) {
       const { runMissionShow } = await import("./mission.js");
       const code = await withRegistry(({ registry }) =>
         runMissionShow(registry, { missionId, json: opts.json }),
+      );
+      process.exit(code);
+    });
+
+  // ── mission artifacts ─────────────────────────────────────────────────
+  // Operator-DX: walk the mission's promoted artifact tree and print
+  // canonical outputs grouped by grip. Avoids the previous "grep
+  // ~/.openclaw/octo/artifacts/ by hand" forensics workflow that
+  // openclaw-main flagged in the batch 3 friction log.
+  mission
+    .command("artifacts <mission_id>")
+    .description("Show canonical artifact files for a mission, grouped by grip")
+    .option("--json", "Output as JSON")
+    .action(async (missionId, opts) => {
+      const { runMissionArtifacts } = await import("./mission-artifacts.js");
+      const code = await withRegistry(({ registry }) =>
+        runMissionArtifacts(registry, { missionId, json: opts.json }),
       );
       process.exit(code);
     });

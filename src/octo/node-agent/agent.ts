@@ -476,11 +476,32 @@ export class NodeAgent {
 
     let succeeded: boolean;
     if (event.type === "completed") {
-      // completed means exit code 0. For arms that are active, this
-      // maps to the completed state.
-      succeeded = await this.transitionArm(arm, "completed", "arm.completed", {
-        exit_code: event.exit_code,
-      });
+      // Exit code 0 alone is not enough to call this a success. The
+      // 2026-04-12 batch-2 pressure test produced a Gemini round that
+      // exited 0 with a 284-byte "task complete" stdout and no actual
+      // artifact — the chain still emitted grip.completed and operators
+      // had no signal that the deliverable was missing. Verify a real
+      // deliverable exists before transitioning to completed; otherwise
+      // route to failed with reason `completed_no_deliverable` so the
+      // condition surfaces in the event log and any cascade depending
+      // on the output sees the failure rather than acting on emptiness.
+      const deliverable = this.checkDeliverable(arm);
+      if (deliverable.ok) {
+        succeeded = await this.transitionArm(arm, "completed", "arm.completed", {
+          exit_code: event.exit_code,
+          deliverable_check: deliverable.detail,
+        });
+      } else {
+        this.log("warn", "handleProcessEvent: exit 0 but no deliverable", {
+          arm_id: arm.arm_id,
+          reason: deliverable.detail,
+        });
+        succeeded = await this.transitionArm(arm, "failed", "arm.failed", {
+          exit_code: event.exit_code,
+          reason: "completed_no_deliverable",
+          detail: deliverable.detail,
+        });
+      }
     } else {
       // failed -- non-zero exit, sentinel missing, etc.
       succeeded = await this.transitionArm(arm, "failed", "arm.failed", {
@@ -682,29 +703,31 @@ export class NodeAgent {
             const armTemplatesByGrip = (mission.metadata as Record<string, unknown>)
               ?._arm_templates_by_grip as Record<string, unknown[]> | undefined;
 
-            // Read outputs from completed dependency grips so we can
-            // inject them into the judge prompt via string substitution.
+            // Read outputs from completed dependency grips. Two changes
+            // from the prior arg-substitution model:
             //
-            // Per-output cap: 80 KB. The cascade substitutes these
-            // strings into the round-N prompt which becomes a CLI
-            // argument to the runtime executable. macOS / Linux have
-            // a hard kernel limit on argv+envp (ARG_MAX, typically
-            // 256 KB on macOS, 2 MB on Linux), and exceeding it
-            // produces "Argument list too long" (errno E2BIG, exit
-            // code 126) before the runtime even starts. Bug
-            // discovered on 2026-04-12 mission mis-b655ec9f when
-            // codex round-2 produced a 1.3 MB source-landscape
-            // analysis that the round-3 gemini arm couldn't ingest.
+            // 1. We write each dep output to a file inside the downstream
+            //    arm's cwd at `_inputs/<dep-grip-id>.md` so the cascading
+            //    runtime reads it from disk rather than receiving it
+            //    inlined into argv. This kills the ARG_MAX hack (the old
+            //    80 KB cap) entirely — refining rounds can now see the
+            //    full prior work, however large.
             //
-            // 80 KB per dependency output is enough context for
-            // a refining round to see substantive prior work
-            // (~10-15K tokens) while leaving headroom for several
-            // dependencies plus the framing prompt to fit under
-            // ARG_MAX even on tight platforms. If the output is
-            // truncated, we mark it inline so the receiving model
-            // knows it's seeing a head-truncated view rather than
-            // the full document.
-            const MAX_DEP_OUTPUT_BYTES = 80_000;
+            // 2. The placeholder `[Output will be provided from grip: X]`
+            //    in the framed prompt is replaced with a file-reference
+            //    sentence pointing the model at `_inputs/X.md`, instead
+            //    of being substituted with the raw bytes. Strategies that
+            //    pre-bake the placeholder into args (collaborative,
+            //    competitive, council, consensus) work without changes —
+            //    they still see substitution happen, just to a path
+            //    string instead of inlined content.
+            //
+            // Why not just rely on the parent grip's stdout file in
+            // sentinelDir? Because that file lives outside cwd and is
+            // not visible to the runtime as a relative path. Putting
+            // dep outputs inside the arm's cwd makes them explicitly
+            // discoverable by both filesystem-model and stdout-model
+            // runtimes.
             const depOutputs: Record<string, string> = {};
             const os = await import("node:os");
             const fs = await import("node:fs");
@@ -714,20 +737,35 @@ export class NodeAgent {
               const nsDep = `${arm.mission_id}/${depId}`;
               const depGrip = gripsByRawId.get(nsDep);
               if (depGrip?.assigned_arm_id) {
-                const outputFile = pathMod.join(sentinelDir, `${depGrip.assigned_arm_id}.output`);
-                try {
-                  const raw = fs.readFileSync(outputFile, "utf8").trim();
-                  if (raw.length > MAX_DEP_OUTPUT_BYTES) {
-                    const head = raw.slice(0, MAX_DEP_OUTPUT_BYTES);
-                    const droppedBytes = raw.length - MAX_DEP_OUTPUT_BYTES;
-                    depOutputs[depId] =
-                      `${head}\n\n[octo: prior output truncated — ${droppedBytes} bytes omitted to fit ARG_MAX]`;
-                  } else {
-                    depOutputs[depId] = raw;
+                // Try the in-cwd canonical stdout first (for stdout-model
+                // parents), then fall back to sentinelDir/<arm>.output
+                // for filesystem-model parents whose stdout was small or
+                // who streamed only summary text.
+                const parentArmId = depGrip.assigned_arm_id;
+                const parentArm = this.registry.getArm(parentArmId);
+                const parentCwd = parentArm?.spec?.cwd;
+                let raw = "";
+                if (parentCwd) {
+                  const cwdStdoutPath = pathMod.join(
+                    parentCwd,
+                    ".octo",
+                    `${parentArmId}.stdout.md`,
+                  );
+                  try {
+                    raw = fs.readFileSync(cwdStdoutPath, "utf8").trim();
+                  } catch {
+                    raw = "";
                   }
-                } catch {
-                  depOutputs[depId] = "(output not captured)";
                 }
+                if (raw.length === 0) {
+                  const outputFile = pathMod.join(sentinelDir, `${parentArmId}.output`);
+                  try {
+                    raw = fs.readFileSync(outputFile, "utf8").trim();
+                  } catch {
+                    raw = "";
+                  }
+                }
+                depOutputs[depId] = raw.length > 0 ? raw : "(output not captured)";
               }
             }
 
@@ -749,22 +787,56 @@ export class NodeAgent {
             }
 
             for (const template of gripTemplates) {
-              // Inject dependency outputs into the prompt so judges
-              // can actually see the work they're reviewing.
-              let prompt = template.initial_input ?? graphNode.grip_id;
+              // Materialize dep outputs as files in the downstream cwd's
+              // `_inputs/` directory so the runtime can read them as
+              // real files. Then build the placeholder substitution map
+              // to point at relative paths instead of inlined content.
+              const downstreamCwd = template.cwd ?? process.cwd();
+              const inputsDir = pathMod.join(downstreamCwd, "_inputs");
+              try {
+                fs.mkdirSync(inputsDir, { recursive: true });
+              } catch (mkErr) {
+                this.log("warn", "phase cascade: failed to create _inputs dir", {
+                  cwd: downstreamCwd,
+                  error: mkErr instanceof Error ? mkErr.message : String(mkErr),
+                });
+              }
+              const depFileRefs: Record<string, string> = {};
               for (const [depId, output] of Object.entries(depOutputs)) {
-                prompt = prompt.replace(`[Output will be provided from grip: ${depId}]`, output);
+                // Sanitize grip id for use as a filename — grip ids
+                // contain colons in collaborative chains
+                // (e.g. "open-questions:round-1:claude").
+                const safeName = depId.replace(/[^a-zA-Z0-9._-]/g, "_");
+                const depFile = pathMod.join(inputsDir, `${safeName}.md`);
+                try {
+                  fs.writeFileSync(depFile, output, "utf8");
+                  depFileRefs[depId] =
+                    `(prior round output written to ./_inputs/${safeName}.md in your working directory — read it before refining)`;
+                } catch (wErr) {
+                  this.log("warn", "phase cascade: failed to write dep input file", {
+                    dep_id: depId,
+                    path: depFile,
+                    error: wErr instanceof Error ? wErr.message : String(wErr),
+                  });
+                  // Fall back to inline (rare path — disk write failed).
+                  depFileRefs[depId] = output;
+                }
+              }
+
+              // Substitute placeholders in initial_input.
+              let prompt = template.initial_input ?? graphNode.grip_id;
+              for (const [depId, ref] of Object.entries(depFileRefs)) {
+                prompt = prompt.split(`[Output will be provided from grip: ${depId}]`).join(ref);
               }
 
               // Also resolve the same placeholders inside
-              // runtime_options.args so the CLI invocation actually
-              // carries the substituted prompt. Strategies pre-bake
-              // the framed-with-placeholder prompt into args; here we
-              // do the dependency-output substitution pass so the
-              // resolved text reaches the runtime. Without this step
-              // the cascade runs the framed-but-unresolved string,
-              // which is the Bug 2 symptom from
-              // mis-a58fc01e-60a5-43c9-b9ef-134cb42219bb.
+              // runtime_options.args. Strategies pre-bake the framed
+              // prompt with the placeholder into args, so the cascade
+              // must rewrite both surfaces. With file-based handoff
+              // the substituted text is now a short file-reference
+              // sentence rather than the full dep payload, so the
+              // ARG_MAX hazard from the prior arg-substitution model
+              // is gone.
               let rewrittenRuntimeOptions = template.runtime_options as Record<string, unknown>;
               const rtArgs = rewrittenRuntimeOptions?.args;
               if (Array.isArray(rtArgs)) {
@@ -773,8 +845,8 @@ export class NodeAgent {
                     return a;
                   }
                   let out = a;
-                  for (const [depId, output] of Object.entries(depOutputs)) {
-                    out = out.split(`[Output will be provided from grip: ${depId}]`).join(output);
+                  for (const [depId, ref] of Object.entries(depFileRefs)) {
+                    out = out.split(`[Output will be provided from grip: ${depId}]`).join(ref);
                   }
                   return out;
                 });
@@ -1161,6 +1233,116 @@ export class NodeAgent {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Verify the arm produced a real deliverable before declaring it
+   * completed. Stronger than exit-0 alone — exit-0 only proves the
+   * process didn't crash, not that it did the work.
+   *
+   * Two independent paths, OR-combined: an arm passes if EITHER
+   *   (a) its canonical stdout file in .octo/ is large enough to
+   *       represent a real reply, OR
+   *   (b) its touched-files manifest lists at least one non-empty file
+   *       in cwd.
+   *
+   * Why OR, not XOR by runtime model: the 2026-04-12 batch-3 mission 1
+   * (mis-1b65335f, identity-match) caught the edge case where Gemini
+   * round-3 produced 27 KB of real refinement work as files in cwd but
+   * its stdout was only a 1027-byte summary of "I edited X, Y, Z." A
+   * stdout-only check would have FALSELY rejected the run if Gemini
+   * had been any more terse (e.g. "Files updated. Done."). And a
+   * filesystem-only check would falsely reject pure-stdout runtimes
+   * like codex that don't write files at all. Either signal is
+   * sufficient evidence of real work; only when BOTH are absent
+   * should the arm be flagged as completed_no_deliverable.
+   *
+   * Threshold: stdout files smaller than MIN_DELIVERABLE_BYTES are
+   * not enough on their own (catches the Gemini "I have produced the
+   * artifacts. The task is complete." 284-byte short-circuit from
+   * batch-2 mis-4efd999d). The manifest path requires at least one
+   * file with > 0 bytes.
+   */
+  private checkDeliverable(arm: ArmRecord): { ok: boolean; detail: string } {
+    const MIN_DELIVERABLE_BYTES = 512;
+    const armCwd = arm.spec?.cwd;
+    const reasons: string[] = [];
+
+    // Path (a): canonical stdout file
+    let stdoutOk = false;
+    let stdoutDetail = "";
+    if (armCwd) {
+      const stdoutPath = path.join(armCwd, ".octo", `${arm.arm_id}.stdout.md`);
+      try {
+        if (existsSync(stdoutPath)) {
+          const buf = readFileSync(stdoutPath);
+          if (buf.length >= MIN_DELIVERABLE_BYTES) {
+            stdoutOk = true;
+            stdoutDetail = `stdout ${buf.length} bytes`;
+          } else {
+            reasons.push(`stdout ${buf.length}B < ${MIN_DELIVERABLE_BYTES}B`);
+          }
+        } else {
+          reasons.push("no .octo stdout file");
+        }
+      } catch (err) {
+        reasons.push(`stdout read failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    } else {
+      reasons.push("no cwd in spec");
+    }
+
+    // Path (b): touched-files manifest
+    let manifestOk = false;
+    let manifestDetail = "";
+    const manifestPath = path.join(this.sentinelDir, `${arm.arm_id}.touched-files`);
+    try {
+      if (existsSync(manifestPath)) {
+        const lines = readFileSync(manifestPath, "utf8")
+          .split("\n")
+          .map((l) => l.trim())
+          .filter((l) => l.length > 0);
+        // Exclude the .octo stdout file from "real deliverable" counting
+        // — it's the same content path (a) already considered, and
+        // counting it twice would let a tiny stdout double-count as a
+        // file artifact.
+        const stdoutMarker = armCwd ? path.join(armCwd, ".octo", `${arm.arm_id}.stdout.md`) : null;
+        let nonEmptyCount = 0;
+        let totalBytes = 0;
+        for (const filePath of lines) {
+          if (stdoutMarker && filePath === stdoutMarker) {
+            continue;
+          }
+          try {
+            const buf = readFileSync(filePath);
+            if (buf.length > 0) {
+              nonEmptyCount += 1;
+              totalBytes += buf.length;
+            }
+          } catch {
+            // File may have been deleted between manifest write and check.
+          }
+        }
+        if (nonEmptyCount > 0) {
+          manifestOk = true;
+          manifestDetail = `${nonEmptyCount} file(s) ${totalBytes}B`;
+        } else {
+          reasons.push("touched-files manifest has no non-empty files");
+        }
+      } else {
+        reasons.push("no touched-files manifest");
+      }
+    } catch (err) {
+      reasons.push(`manifest read failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    if (stdoutOk || manifestOk) {
+      const parts = [stdoutOk ? stdoutDetail : null, manifestOk ? manifestDetail : null].filter(
+        Boolean,
+      );
+      return { ok: true, detail: parts.join(" + ") };
+    }
+    return { ok: false, detail: reasons.join("; ") };
   }
 
   private watchArm(arm: ArmRecord): void {

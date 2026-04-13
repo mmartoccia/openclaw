@@ -50,6 +50,11 @@ export interface MissionCreateOptions extends MissionJsonOption {
   executionMode?: MissionExecutionMode;
   armTemplates?: ArmTemplate[];
   prompt?: string;
+  // Per-grip prompt overrides — gateway strategy expansion uses these
+  // instead of the mission-wide prompt baked into arm_templates when a
+  // per-grip override is present. See PR description and the 2026-04-12
+  // batch 3 friction log for motivation.
+  gripPrompts?: Record<string, string>;
 }
 
 export interface MissionCreateResult {
@@ -75,6 +80,7 @@ export async function gatherMissionCreate(
       ...(opts.metadata !== undefined ? { metadata: opts.metadata } : {}),
       ...(opts.executionMode !== undefined ? { execution_mode: opts.executionMode } : {}),
       ...(opts.armTemplates !== undefined ? { arm_templates: opts.armTemplates } : {}),
+      ...(opts.gripPrompts !== undefined ? { grip_prompts: opts.gripPrompts } : {}),
     },
   });
   return {

@@ -104,6 +104,13 @@ export const PtyTmuxRuntimeOptionsSchema = Type.Object(
     captureCols: Type.Optional(Type.Integer({ minimum: 1 })),
     captureRows: Type.Optional(Type.Integer({ minimum: 1 })),
     idleTimeoutS: Type.Optional(Type.Integer({ minimum: 0 })),
+    // output_model declares whether the runtime canonically writes its
+    // deliverable to the filesystem (claude-code) or streams to stdout
+    // (codex, gemini, aider). The pty_tmux wrapper uses this to decide
+    // whether to copy the captured stdout into a canonical file inside
+    // cwd so the artifact promoter and downstream cascade can find it.
+    // Default treated as "filesystem" for backwards compat.
+    output_model: Type.Optional(Type.Union([Type.Literal("filesystem"), Type.Literal("stdout")])),
   },
   { additionalProperties: false },
 );
@@ -590,6 +597,17 @@ export const MissionSpecSchema = Type.Object(
       Type.Array(ArmTemplateSchema, {
         minItems: 1,
         maxItems: MISSION_ARM_TEMPLATES_MAX,
+      }),
+    ),
+    // Per-grip prompt overrides. When present, the gateway's strategy
+    // expansion uses grip_prompts[grip_id] for that grip's framing
+    // instead of the mission-wide prompt baked into arm_templates.
+    // Lets a single mission carry distinct task text per grip without
+    // forcing the operator to launch N separate missions. Added
+    // 2026-04-12 from openclaw-main's batch 3 friction log.
+    grip_prompts: Type.Optional(
+      Type.Record(Type.String(), Type.String(), {
+        maxProperties: MISSION_GRAPH_MAX_NODES,
       }),
     ),
   },

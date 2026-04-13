@@ -1400,12 +1400,59 @@ export class OctoGatewayHandlers {
       const allGraphNodes: Array<{ grip_id: string; depends_on: string[] }> = [];
       expandedArmTemplatesByGrip = new Map();
 
+      // Per-grip prompt overrides — see MissionSpecSchema.grip_prompts
+      // and the 2026-04-12 operator-DX hardening pass. When present,
+      // each grip uses its own prompt for framing instead of the
+      // mission-wide prompt baked into spec.arm_templates. We also
+      // ALWAYS isolate per-grip cwds (pass 1.5 hotfix) by deriving
+      // <base-cwd>/<sanitized-grip-id> per grip, regardless of whether
+      // grip_prompts is set. Shared cwd across parallel grips caused
+      // manifest find-newer cross-contamination in promoted artifact
+      // directories — see the 2026-04-12 mis-0429b31e smoke probe.
+      const gripPrompts = (spec as { grip_prompts?: Record<string, string> }).grip_prompts;
+      const baseMissionPrompt = spec.arm_templates[0].initial_input ?? "";
+      const { rewriteArgsForPrompt } = await import("../head/strategies/rewrite-prompt.js");
+      const pathMod = await import("node:path");
+
+      // Sanitize a grip id for use as a directory name. Mirrors the
+      // CLI's per-grip cwd derivation in register.ts so --input
+      // staging and gateway expansion produce the same paths.
+      const sanitizeGripForCwd = (gripId: string): string =>
+        gripId.replace(/[^a-zA-Z0-9._-]/g, "_");
+
       for (const originalNode of spec.graph) {
-        const prompt = spec.arm_templates[0].initial_input ?? originalNode.grip_id;
+        const perGripPrompt = gripPrompts?.[originalNode.grip_id];
+        const prompt = perGripPrompt ?? baseMissionPrompt ?? originalNode.grip_id;
+        // Derive per-grip cwd from the FIRST template's cwd (all
+        // templates in a mission share the same base cwd by
+        // construction in register.ts). When the spec only has one
+        // grip we keep the base cwd as-is to avoid changing
+        // single-grip mission behavior.
+        const baseCwd = spec.arm_templates[0].cwd ?? "";
+        const useGripSubdir = spec.graph.length > 1 && baseCwd !== "";
+        const gripCwd = useGripSubdir
+          ? pathMod.join(baseCwd, sanitizeGripForCwd(originalNode.grip_id))
+          : baseCwd;
+
+        // Always rebuild per-grip arm templates so cwd isolation
+        // applies to every grip in a multi-grip mission. Apply
+        // prompt override only when grip_prompts has an entry.
+        const armTemplatesForGrip = spec.arm_templates.map((t) => {
+          const next = { ...t, cwd: gripCwd || t.cwd };
+          if (perGripPrompt) {
+            next.initial_input = perGripPrompt;
+            next.runtime_options = rewriteArgsForPrompt(
+              t.runtime_options,
+              baseMissionPrompt,
+              perGripPrompt,
+            );
+          }
+          return next;
+        });
         const expandOpts = {
           gripId: originalNode.grip_id,
           prompt,
-          armTemplates: spec.arm_templates,
+          armTemplates: armTemplatesForGrip,
         };
 
         let expanded: Awaited<ReturnType<typeof expandCompetitiveGraph>>;

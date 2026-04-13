@@ -92,6 +92,7 @@ export class PtyTmuxAdapter implements Adapter {
       tmuxSessionName?: string;
       captureCols?: number;
       captureRows?: number;
+      output_model?: "filesystem" | "stdout";
     };
 
     // Derive arm_id from the injected _arm_id field (set by gateway handler)
@@ -116,6 +117,14 @@ export class PtyTmuxAdapter implements Adapter {
     // The wrapper captures $? from the user command, writes it to a
     // sentinel file, then exits with the original code. The sentinel path
     // uses the same convention as NodeAgent.sentinelPathForArm().
+    // Ensure the arm's working directory exists. With per-grip cwd
+    // isolation (added 2026-04-12 operator-DX pass 1.5), each arm's
+    // cwd may be a freshly-derived subdirectory like
+    // `<base>/<grip-id>` that nothing else has created yet. Without
+    // this mkdir, tmux new-session fails with "no such file or
+    // directory" before the wrapper script ever runs.
+    mkdirSync(spec.cwd, { recursive: true });
+
     let cmd: string;
     if (armId) {
       mkdirSync(this.sentinelDir, { recursive: true });
@@ -124,6 +133,20 @@ export class PtyTmuxAdapter implements Adapter {
       const touchedPath = join(this.sentinelDir, `${armId}.touched-files`);
       const startMarkerPath = join(this.sentinelDir, `${armId}.start-marker`);
       const scriptPath = join(this.sentinelDir, `${armId}.sh`);
+      // Per-arm canonical stdout deliverable inside cwd. For stdout-model
+      // runtimes (codex, gemini, aider) this is the artifact: it is what
+      // the manifest find-newer captures, what the artifact promoter
+      // copies into the mission tree, what the deliverable check verifies,
+      // and what the dependency-output cascade reads when handing the
+      // file to a downstream round. We always create the .octo subdir
+      // and parameterize on output_model below — filesystem-model runtimes
+      // (claude-code) skip the stdout-tee inside cwd to avoid polluting
+      // the user's working tree with a redundant copy of stdout that
+      // would otherwise show up in the touched-files manifest alongside
+      // the real edits the model made.
+      const cwdOctoDir = join(spec.cwd, ".octo");
+      const cwdStdoutPath = join(cwdOctoDir, `${armId}.stdout.md`);
+      const outputModel = rtOpts.output_model ?? "filesystem";
       // Wrap the user command with:
       //   (1) a start-marker file (touched before the run) so we can
       //       later diff the cwd for files newer than that marker
@@ -154,12 +177,23 @@ export class PtyTmuxAdapter implements Adapter {
       // contents need to fit on disk. Bug discovered mid-rerun on
       // 2026-04-12 mission mis-0841157f.
       const cwdQuoted = shellQuote(spec.cwd);
+      const cwdOctoQuoted = shellQuote(cwdOctoDir);
+      const cwdStdoutQuoted = shellQuote(cwdStdoutPath);
+      // For stdout-model runtimes, ALSO tee into a canonical file inside
+      // cwd so the manifest find-newer catches it and the cascade can
+      // hand it to downstream rounds as a real file. For filesystem-model
+      // runtimes the in-cwd tee is suppressed (`/dev/null` instead) so we
+      // don't pollute the touched-files manifest with a stdout copy that
+      // would race with the model's real edits.
+      const cwdTeeTarget = outputModel === "stdout" ? cwdStdoutQuoted : "/dev/null";
       const scriptBody =
         `#!/bin/bash\n` +
         `# Auto-generated wrapper for octo arm ${armId}\n` +
+        `# output_model: ${outputModel}\n` +
         `# Lifecycle: start-marker → user command (tee'd) → manifest find → sentinel exit\n` +
+        `mkdir -p ${cwdOctoQuoted}\n` +
         `touch ${startMarkerPath}\n` +
-        `${userCmd} 2>&1 | tee ${outputPath}\n` +
+        `${userCmd} 2>&1 | tee ${outputPath} | tee ${cwdTeeTarget} >/dev/null\n` +
         `_ec=\${PIPESTATUS[0]:-$?}\n` +
         // -H: follow symlinks given as command-line args. Without this
         // flag, `find /tmp ...` on macOS treats /tmp as a symlink and
