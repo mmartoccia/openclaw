@@ -12,6 +12,8 @@ import type { Command } from "commander";
 import {
   defaultMeetDeps,
   dialMeeting,
+  doctorMeet,
+  formatDoctorResult,
   listMeetings,
   pickupMeeting,
   renderTranscript,
@@ -276,5 +278,44 @@ ${formatHelpExamples([
     .action((opts) => {
       const meeting = showMeeting(deps, String(opts.meeting));
       emit(renderTranscript(meeting), false);
+    });
+
+  // ── doctor ───────────────────────────────────────────────────────────
+  // Smoke-test the meet bridge end-to-end. Intended to run on demand
+  // (when something feels off) or on gateway start to catch silent
+  // protocol drift like the 2026-04-12 body-post regression.
+  //
+  // Local-only mode (no flags): verifies the filesystem state machine.
+  // Channel mode (--channel + --target): additionally runs a real turn
+  // through the given channel and records which specific step fails
+  // if the bridge drifts.
+  meet
+    .command("doctor")
+    .description("Smoke-test the meet bridge end-to-end (dial → pickup → send → wrap)")
+    .option("--channel <channel>", "Channel to test (e.g. telegram); omit for local-only check")
+    .option(
+      "--target <id>",
+      "Target chat/account id for the channel test (required with --channel)",
+    )
+    .option("--no-cleanup", "Leave the test meeting in active/ instead of wrapping it", false)
+    .option("--json", "Output JSON instead of human-readable", false)
+    .action(async (opts) => {
+      const channel = stringOrUndef(opts.channel);
+      const target = stringOrUndef(opts.target);
+      if (channel && !target) {
+        process.stderr.write("meet doctor: --target is required when --channel is set\n");
+        process.exit(2);
+      }
+      const result = await doctorMeet(deps, {
+        channel,
+        target,
+        cleanup: opts.cleanup !== false,
+      });
+      if (opts.json) {
+        emit(result, true);
+      } else {
+        emit(formatDoctorResult(result), false);
+      }
+      process.exit(result.ok ? 0 : 1);
     });
 }

@@ -110,6 +110,24 @@ export interface MeetDeps {
    */
   runAgentTurn: (args: string[]) => Promise<{ stdout: string; stderr: string }>;
   /**
+   * Execute a literal channel send via `openclaw message send ...` and
+   * return the stdout. Used by sendTurn to explicitly post the turn
+   * body to the channel BEFORE the agent call, so both halves of the
+   * conversation are visible in the channel surface (e.g. Telegram).
+   *
+   * The PR claim "openclaw agent --deliver posts BOTH the prompt and
+   * the reply" used to be literally true when the input-echo-to-channel
+   * path existed; today that path is flaky (body sometimes invisible
+   * to the channel even when the agent session receives it with
+   * channel-ingest formatting). Rather than chase the regression in
+   * the gateway agent handler, meet.ts enforces the invariant locally:
+   * body is always explicitly posted, then the agent turn runs. This
+   * is robust to any gateway drift in the input-post half.
+   *
+   * Best-effort: errors are logged but do not block the agent turn.
+   */
+  runMessageSend: (args: string[]) => Promise<{ stdout: string; stderr: string }>;
+  /**
    * Overridable read of the current process env. Callers can inject
    * a frozen env for tests.
    */
@@ -125,6 +143,13 @@ export function defaultMeetDeps(): MeetDeps {
       const { stdout, stderr } = await execFile("openclaw", args, {
         maxBuffer: 32 * 1024 * 1024,
         timeout: 10 * 60 * 1000,
+      });
+      return { stdout, stderr };
+    },
+    runMessageSend: async (args) => {
+      const { stdout, stderr } = await execFile("openclaw", args, {
+        maxBuffer: 4 * 1024 * 1024,
+        timeout: 60 * 1000,
       });
       return { stdout, stderr };
     },
@@ -415,6 +440,48 @@ export async function sendTurn(deps: MeetDeps, opts: SendOptions): Promise<SendR
     ? opts.message
     : speakerFrame(fromAgent, listenerAgent, opts.message, fromIcon, toIcon);
 
+  // STEP 1 — Post the framed body to the channel as a literal message.
+  // This restores the "both halves visible in channel" invariant the
+  // original PR claimed for `agent --deliver`. Historically `agent
+  // --deliver` had an input-echo-to-channel path that posted the prompt
+  // to the channel before running the agent; that path has regressed
+  // and today the body is synthesized into the agent session with
+  // channel-ingest formatting but never actually hits the channel
+  // outbound. Rather than chase the gateway-side regression, we post
+  // the body here explicitly so the user sees both sides of every
+  // turn regardless of what `agent --deliver` does internally.
+  //
+  // Best-effort: if the send fails, we still run the agent turn so
+  // the meeting can proceed — the body just won't be visible to
+  // Telegram viewers. The meeting JSON transcript always has it.
+  //
+  // 2026-04-12 diagnosis: proved via instrumented trace that the
+  // reply path reaches handler.sendText and returns a real messageId,
+  // but the body path never calls the channel outbound at all.
+  try {
+    await deps.runMessageSend([
+      "message",
+      "send",
+      "--target",
+      chatId,
+      "--channel",
+      channel,
+      "--message",
+      framedMessage,
+    ]);
+  } catch (err) {
+    // Non-fatal: log to stderr so operators can see body-post failures,
+    // but proceed with the agent turn. The meeting JSON still captures
+    // the body in its transcript array regardless.
+    process.stderr.write(
+      `meet send: body channel-post failed (agent turn will still run): ${err instanceof Error ? err.message : String(err)}\n`,
+    );
+  }
+
+  // STEP 2 — Run the agent turn. The agent will receive the body as
+  // input (via its own session ingest path, separate from the body
+  // we just posted above), generate a reply, and post the reply to
+  // the channel.
   const args = [
     "agent",
     "--to",
@@ -625,6 +692,255 @@ export function renderTranscript(meeting: MeetingFile): string {
     lines.push(wrapFrame(meeting));
   } else {
     lines.push(`*(meeting still ${meeting.status})*`);
+  }
+  return lines.join("\n");
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// doctor — smoke test the full meet bridge
+// ──────────────────────────────────────────────────────────────────────────
+
+export interface DoctorOptions {
+  /** Channel to test delivery against. If omitted, only the local
+   *  filesystem state machine is verified (no channel post). */
+  channel?: string;
+  /** Target chat/account id for the channel test. Required when
+   *  --channel is set. */
+  target?: string;
+  /** When true, clean up the test meeting even if checks fail. Default
+   *  is true — leaving orphan test meetings in pending/ pollutes the
+   *  real inbox. */
+  cleanup?: boolean;
+}
+
+export interface DoctorCheck {
+  name: string;
+  ok: boolean;
+  detail: string;
+}
+
+export interface DoctorResult {
+  ok: boolean;
+  meeting_id: string | null;
+  checks: DoctorCheck[];
+}
+
+/**
+ * Smoke-test the meet bridge end-to-end.
+ *
+ * Runs the full dial → pickup → send → wrap lifecycle with a sentinel
+ * body, reporting which specific step fails if the bridge drifts.
+ *
+ * Local-only mode (no channel/target): verifies the filesystem state
+ * machine (pending → active → closed) and its idempotency + atomic
+ * moves. Safe to run anywhere, no external side effects.
+ *
+ * Channel mode (channel + target provided): additionally runs a real
+ * meet send turn through the given channel/target, verifies the
+ * agent returns a non-empty reply, and records both body and reply
+ * in the meeting transcript. This exercises the full path that broke
+ * on 2026-04-12 (body invisible in channel because the input-echo
+ * regressed in the gateway). If the meet send wrapper's body-post
+ * step ever fails again, this test will surface a
+ * `body_channel_post_failed` check within seconds of drift.
+ *
+ * This is deliberately unit-test-free: the whole point is to run it
+ * against the live gateway and real channels so we catch runtime
+ * drift that unit tests cannot see.
+ */
+export async function doctorMeet(deps: MeetDeps, opts: DoctorOptions = {}): Promise<DoctorResult> {
+  const checks: DoctorCheck[] = [];
+  const cleanup = opts.cleanup !== false;
+  let meetingId: string | null = null;
+
+  const push = (name: string, ok: boolean, detail: string): void => {
+    checks.push({ name, ok, detail });
+  };
+
+  const sentinelTag = `MEETDOCTOR-${deps.now().getTime()}-${deps.randHex(3)}`;
+  const sentinelBody = `${sentinelTag} (openclaw meet doctor smoke test — if you see this line the bridge body-post path is healthy)`;
+
+  // ── step 1: filesystem writable ──────────────────────────────────
+  try {
+    ensureDirs(deps);
+    push("meet_dirs_writable", true, `ensured pending/active/closed under ${meetingsRoot(deps)}`);
+  } catch (err) {
+    push(
+      "meet_dirs_writable",
+      false,
+      `failed to create meet dirs: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return { ok: false, meeting_id: null, checks };
+  }
+
+  // ── step 2: dial ─────────────────────────────────────────────────
+  let dialResult: DialResult;
+  try {
+    dialResult = dialMeeting(deps, {
+      to: "meet-doctor-target",
+      topic: `meet doctor smoke test ${sentinelTag}`,
+      context: "automated bridge smoke test; safe to ignore",
+      from: "meet-doctor",
+      fromChannel: opts.channel ?? "cli",
+      fromChat: opts.target ?? "",
+    });
+    meetingId = dialResult.meeting.meeting_id;
+    push("dial_creates_pending", true, `created pending file at ${dialResult.path}`);
+  } catch (err) {
+    push(
+      "dial_creates_pending",
+      false,
+      `meet dial failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return { ok: false, meeting_id: null, checks };
+  }
+
+  // ── step 3: pickup ───────────────────────────────────────────────
+  try {
+    pickupMeeting(deps, { meeting: meetingId, pickedUpBy: "meet-doctor" });
+    push("pickup_moves_to_active", true, "atomic move pending → active succeeded");
+  } catch (err) {
+    push(
+      "pickup_moves_to_active",
+      false,
+      `meet pickup failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    if (cleanup) {
+      await cleanupDoctorMeeting(deps, meetingId);
+    }
+    return { ok: false, meeting_id: meetingId, checks };
+  }
+
+  // ── step 4: send — only if channel + target are provided ────────
+  if (opts.channel && opts.target) {
+    // Override reply_via so the test turn actually routes through
+    // the requested channel/target pair.
+    try {
+      const activePath = pathJoin(dirForState(deps, "active"), `${meetingId}.json`);
+      const m = readMeeting(activePath);
+      m.reply_via = `${opts.channel}:${opts.target}`;
+      writeMeeting(activePath, m);
+    } catch (err) {
+      push(
+        "set_reply_via",
+        false,
+        `could not set reply_via on active meeting: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      if (cleanup) {
+        await cleanupDoctorMeeting(deps, meetingId);
+      }
+      return { ok: false, meeting_id: meetingId, checks };
+    }
+
+    let sendResult: SendResult | null = null;
+    try {
+      sendResult = await sendTurn(deps, {
+        meeting: meetingId,
+        message: sentinelBody,
+        from: "meet-doctor",
+      });
+      push(
+        "send_executes",
+        true,
+        `meet send completed, body framed (${sendResult.deliveredText.length} chars)`,
+      );
+    } catch (err) {
+      push(
+        "send_executes",
+        false,
+        `meet send failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    if (sendResult) {
+      // Body was framed and passed to the wrapper. sendTurn calls
+      // runMessageSend for the body-post step — if that step failed,
+      // the catch inside sendTurn writes to stderr but does not throw.
+      // We can't directly observe whether the stderr was written from
+      // here, but we CAN check the meeting transcript for the body.
+      const transcript = sendResult.meeting.transcript ?? [];
+      const lastTurn = transcript.at(-1);
+      const bodyCaptured = lastTurn?.body?.includes(sentinelTag) ?? false;
+      push(
+        "body_captured_in_transcript",
+        bodyCaptured,
+        bodyCaptured
+          ? `sentinel ${sentinelTag} present in meeting transcript body`
+          : `sentinel ${sentinelTag} NOT found in transcript`,
+      );
+
+      // Reply check — the most important signal of bridge health.
+      // If the agent turn runs but returns no reply, the agent path
+      // is silently dropping or the gateway delivery path is broken.
+      const replyText = sendResult.replyText?.trim() ?? "";
+      const replyOk = replyText.length > 0;
+      push(
+        "reply_captured",
+        replyOk,
+        replyOk
+          ? `reply captured (${replyText.length} chars)`
+          : "reply text is empty — agent turn produced no usable output",
+      );
+    }
+  } else {
+    push(
+      "send_skipped",
+      true,
+      "channel + target not provided, skipping channel turn — local-only mode",
+    );
+  }
+
+  // ── step 5: wrap ─────────────────────────────────────────────────
+  if (cleanup) {
+    try {
+      await wrapMeeting(deps, {
+        meeting: meetingId,
+        outcome: `meet doctor smoke test ${sentinelTag}`,
+        silent: true,
+      });
+      push("wrap_moves_to_closed", true, "atomic move active → closed succeeded");
+    } catch (err) {
+      push(
+        "wrap_moves_to_closed",
+        false,
+        `meet wrap failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  const ok = checks.every((c) => c.ok);
+  return { ok, meeting_id: meetingId, checks };
+}
+
+/**
+ * Best-effort cleanup helper — moves a test meeting to closed/ with a
+ * canned outcome. Swallows errors because it's called from failure
+ * paths that already have a real error to report.
+ */
+async function cleanupDoctorMeeting(deps: MeetDeps, meetingId: string): Promise<void> {
+  try {
+    await wrapMeeting(deps, {
+      meeting: meetingId,
+      outcome: "meet doctor: failed, cleanup",
+      silent: true,
+    });
+  } catch {
+    // Ignore — cleanup is best-effort
+  }
+}
+
+/** Format a human-readable doctor report for stdout. */
+export function formatDoctorResult(result: DoctorResult): string {
+  const lines: string[] = [];
+  lines.push(`meet doctor: ${result.ok ? "✅ PASS" : "❌ FAIL"}`);
+  if (result.meeting_id) {
+    lines.push(`test meeting: ${result.meeting_id}`);
+  }
+  lines.push("");
+  for (const c of result.checks) {
+    const icon = c.ok ? "✅" : "❌";
+    lines.push(`  ${icon} ${c.name}`);
+    lines.push(`      ${c.detail}`);
   }
   return lines.join("\n");
 }

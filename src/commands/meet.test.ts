@@ -25,6 +25,7 @@ let tmp: string;
 let clock: Date;
 let randCounter: number;
 let runAgentTurn: ReturnType<typeof vi.fn>;
+let runMessageSend: ReturnType<typeof vi.fn>;
 let deps: MeetDeps;
 
 beforeEach(() => {
@@ -33,6 +34,10 @@ beforeEach(() => {
   randCounter = 0;
   runAgentTurn = vi.fn(async (_args: string[]) => ({
     stdout: JSON.stringify({ result: { meta: { finalAssistantVisibleText: "ok from mock" } } }),
+    stderr: "",
+  }));
+  runMessageSend = vi.fn(async (_args: string[]) => ({
+    stdout: "✅ Sent via Telegram. Message ID: test-123\n",
     stderr: "",
   }));
   deps = {
@@ -44,6 +49,7 @@ beforeEach(() => {
       return randCounter.toString(16).padStart(6, "0");
     },
     runAgentTurn,
+    runMessageSend,
     env: () => ({}),
   };
 });
