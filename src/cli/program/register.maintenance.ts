@@ -1,6 +1,7 @@
 import type { Command } from "commander";
 import { dashboardCommand } from "../../commands/dashboard.js";
 import { doctorCommand } from "../../commands/doctor.js";
+import { defaultMeetDeps, doctorMeet, formatDoctorResult } from "../../commands/meet.js";
 import { resetCommand } from "../../commands/reset.js";
 import { uninstallCommand } from "../../commands/uninstall.js";
 import { defaultRuntime } from "../../runtime.js";
@@ -25,6 +26,10 @@ export function registerMaintenanceCommands(program: Command) {
     .option("--non-interactive", "Run without prompts (safe migrations only)", false)
     .option("--generate-gateway-token", "Generate and configure a gateway token", false)
     .option("--deep", "Scan system services for extra gateway installs", false)
+    .option(
+      "--no-meet-bridge",
+      "Skip the meet bridge smoke test at the end of doctor (default: run it)",
+    )
     .action(async (opts) => {
       await runCommandWithRuntime(defaultRuntime, async () => {
         await doctorCommand(defaultRuntime, {
@@ -36,6 +41,37 @@ export function registerMaintenanceCommands(program: Command) {
           generateGatewayToken: Boolean(opts.generateGatewayToken),
           deep: Boolean(opts.deep),
         });
+        // Meet bridge smoke test — runs after the upstream doctor
+        // returns, additive only, non-fatal. Verifies the meet
+        // protocol's filesystem state machine is healthy (local-only
+        // mode, no channel posts). The 2026-04-12 bridge drift cost
+        // hours of debugging; having this check run as part of the
+        // standard doctor output catches future drift in seconds.
+        //
+        // Pass --no-meet-bridge to skip (e.g. in environments where
+        // ~/.openclaw/meetings/ is intentionally not writable).
+        // For the full channel-mode smoke test (sends a real
+        // sentinel message and waits for a real agent reply), run
+        // 'openclaw meet doctor --channel telegram --target <chat_id>'
+        // directly — it is not enabled here because it has visible
+        // side effects (message posts to a real chat).
+        if (opts.meetBridge !== false) {
+          try {
+            const meetResult = await doctorMeet(defaultMeetDeps(), {});
+            defaultRuntime.log("\n--- Meet bridge ---");
+            defaultRuntime.log(formatDoctorResult(meetResult));
+            if (!meetResult.ok) {
+              defaultRuntime.log(
+                "\nMeet bridge check failed — see docs/octopus-orchestrator/MEET-BRIDGE-CONTRACT.md",
+              );
+            }
+          } catch (err) {
+            defaultRuntime.log(
+              `\n--- Meet bridge ---\n⚠️  meet doctor threw: ${err instanceof Error ? err.message : String(err)}\n` +
+                "See docs/octopus-orchestrator/MEET-BRIDGE-CONTRACT.md for the contract.",
+            );
+          }
+        }
         defaultRuntime.exit(0);
       });
     });

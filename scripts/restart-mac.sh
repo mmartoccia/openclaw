@@ -267,3 +267,45 @@ fi
 if [ "$NO_SIGN" -eq 1 ] && [ "$ATTACH_ONLY" -ne 1 ]; then
   run_step "show gateway launch agent args (unsigned)" bash -lc "/usr/bin/plutil -p '${HOME}/Library/LaunchAgents/ai.openclaw.gateway.plist' | head -n 40 || true"
 fi
+
+# 6) Meet bridge smoke test (post-restart drift catcher).
+#
+# The meet bridge has drifted silently after gateway restarts before
+# (see docs/octopus-orchestrator/MEET-BRIDGE-CONTRACT.md, 2026-04-12
+# incident). Run the local-mode smoke test after every restart so any
+# filesystem state-machine drift is caught in seconds, not hours. Also
+# sync main's SYSTEM.md fragment so the meet bridge invariants are
+# restored if main's identity file was wiped.
+#
+# Local mode only by default — no channel posts. Set
+# OPENCLAW_MEET_DOCTOR_CHANNEL and OPENCLAW_MEET_DOCTOR_TARGET to
+# additionally run the channel smoke test against a real chat (sends
+# a sentinel message and waits for a real reply from the agent).
+#
+# Non-fatal: a failing smoke test logs a warning but does not fail
+# the restart script, so an operator can still finish recovery work.
+log "==> post-restart meet bridge checks"
+if [ -x "${ROOT_DIR}/scripts/sync-main-identity.sh" ]; then
+  if "${ROOT_DIR}/scripts/sync-main-identity.sh" >/dev/null 2>&1; then
+    log "meet bridge: main SYSTEM.md fragment synced"
+  else
+    log "meet bridge: main SYSTEM.md sync returned non-zero (main agent may not be initialized yet)"
+  fi
+fi
+MEET_DOCTOR_BIN="${ROOT_DIR}/openclaw.mjs"
+if [ -f "$MEET_DOCTOR_BIN" ]; then
+  MEET_DOCTOR_ARGS=(meet doctor)
+  if [ -n "${OPENCLAW_MEET_DOCTOR_CHANNEL:-}" ] && [ -n "${OPENCLAW_MEET_DOCTOR_TARGET:-}" ]; then
+    MEET_DOCTOR_ARGS+=(--channel "${OPENCLAW_MEET_DOCTOR_CHANNEL}")
+    MEET_DOCTOR_ARGS+=(--target "${OPENCLAW_MEET_DOCTOR_TARGET}")
+  fi
+  if node "$MEET_DOCTOR_BIN" "${MEET_DOCTOR_ARGS[@]}" >/tmp/openclaw-meet-doctor.log 2>&1; then
+    log "meet bridge: ✅ doctor passed ($(head -n 1 /tmp/openclaw-meet-doctor.log))"
+  else
+    log "meet bridge: ⚠️  doctor FAILED — see /tmp/openclaw-meet-doctor.log"
+    log "meet bridge: run 'openclaw meet doctor --channel telegram --target <chat_id>' to investigate"
+    log "meet bridge: contract at docs/octopus-orchestrator/MEET-BRIDGE-CONTRACT.md"
+  fi
+else
+  log "meet bridge: skipping smoke test — ${MEET_DOCTOR_BIN} not found"
+fi
