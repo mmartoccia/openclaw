@@ -29,10 +29,19 @@
 //
 // POSIX append atomicity:
 //   `fs/promises.appendFile` uses O_APPEND semantics on POSIX, which is
-//   atomic for writes smaller than PIPE_BUF (typically 4096 bytes — well
-//   above any single-event JSON line we produce). On Windows the guarantee
-//   is weaker; cross-platform exact-once-write-or-fail is deferred to a
-//   later milestone.
+//   atomic ONLY for writes up to PIPE_BUF (512 bytes on macOS, 4096 on
+//   Linux). Octo events can exceed 500KB when arm specs carry long
+//   prompt args or diff content, and concurrent `append()` calls from a
+//   single node-agent process CAN interleave at the syscall layer —
+//   observed 2026-04-13 as a 540KB arm.created event spliced mid-word
+//   by a 290B policy.decision event, breaking replay.
+//
+//   The fix: serialize appends in-process via a single-linked promise
+//   chain (`writeChain`). Every call to `append()` links onto the tail of
+//   the chain so writes strictly queue, and POSIX O_APPEND's per-write
+//   atomicity suffices (because no two writes are ever in flight at once).
+//   Cross-process concurrency is still unsafe and is deferred to a later
+//   milestone (flock(2) or lockfile).
 
 import { randomFillSync } from "node:crypto";
 import { createReadStream, existsSync, mkdirSync, statSync } from "node:fs";
@@ -328,6 +337,11 @@ function resolveCurrentSchemaVersion(
 export class EventLogService {
   public readonly path: string;
 
+  // In-process write serialization. Every `append()` chains onto the
+  // tail of this promise so concurrent callers are queued, not raced.
+  // See the "POSIX append atomicity" note at the top of this file.
+  private writeChain: Promise<void> = Promise.resolve();
+
   constructor(opts: EventLogServiceOptions = {}) {
     this.path = opts.path ?? resolveEventLogPath();
   }
@@ -365,7 +379,20 @@ export class EventLogService {
       mkdirSync(parent, { recursive: true, mode: EVENT_LOG_DIR_MODE });
     }
 
-    await appendFile(this.path, `${JSON.stringify(envelope)}\n`, "utf8");
+    // Serialize the write against any in-flight append on the same
+    // service instance. POSIX O_APPEND is only atomic for writes ≤
+    // PIPE_BUF; large envelopes (arm specs with long args) CAN and HAVE
+    // interleaved at the kernel. The writeChain guarantees no two
+    // writes are concurrent at the syscall layer.
+    //
+    // We `.catch(() => {})` on the link so a prior append's rejection
+    // does not poison the chain and starve subsequent writers; each
+    // caller still sees its own error via the awaited `thisWrite`.
+    const line = `${JSON.stringify(envelope)}\n`;
+    const thisWrite = this.writeChain.then(() => appendFile(this.path, line, "utf8"));
+    this.writeChain = thisWrite.catch(() => {});
+    await thisWrite;
+
     return envelope;
   }
 

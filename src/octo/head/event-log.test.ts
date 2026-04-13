@@ -655,4 +655,99 @@ describe("tail (M1-06)", () => {
     ctrl.abort();
     await done;
   });
+
+  // Regression tests for the 2026-04-13 "events.jsonl malformed at line
+  // 1059" corruption. Root cause: concurrent appendFile calls where the
+  // large write (arm.created with multi-hundred-KB runtime args) was
+  // interrupted mid-syscall by a small write (policy.decision), because
+  // POSIX O_APPEND is only atomic for writes ≤ PIPE_BUF (512B on macOS).
+  // Fix: in-process writeChain that serializes appends so no two writes
+  // are ever in flight at the syscall layer. These tests fire N concurrent
+  // appends (without awaiting sequentially) and assert every line is
+  // still valid JSON after the fact.
+
+  it("serializes concurrent small appends so every line round-trips", async () => {
+    const N = 200;
+    const pending: Promise<EventEnvelope>[] = [];
+    for (let i = 0; i < N; i++) {
+      pending.push(svc.append(makeInput({ entity_id: `arm-${i}`, payload: { i } })));
+    }
+    const envelopes = await Promise.all(pending);
+    expect(envelopes).toHaveLength(N);
+
+    const raw = readFileSync(logPath, "utf8");
+    const lines = raw.split("\n").filter((l) => l.length > 0);
+    expect(lines).toHaveLength(N);
+    // Every line MUST parse cleanly — no interleaving.
+    for (const line of lines) {
+      expect(() => JSON.parse(line)).not.toThrow();
+    }
+    // And the set of event_ids on disk matches what append returned.
+    const fileIds = new Set(lines.map((l) => (JSON.parse(l) as EventEnvelope).event_id));
+    const returnedIds = new Set(envelopes.map((e) => e.event_id));
+    expect(fileIds).toEqual(returnedIds);
+  });
+
+  it("serializes concurrent LARGE appends without interleaving", async () => {
+    // Simulates the actual bug: an arm.created event with a very long
+    // payload (> PIPE_BUF, so the kernel can preempt mid-write) racing
+    // against small policy.decision events. Before the fix, the small
+    // write would splice itself inside the large one mid-word.
+    const largePayload = {
+      args: [
+        // ~600KB of content to force the kernel to chunk the write
+        "A".repeat(600_000),
+      ],
+    };
+    const smallPayload = { verdict: "allow" };
+
+    const fires: Promise<EventEnvelope>[] = [];
+    // Interleave large and small calls without awaiting — this is the
+    // exact call pattern that triggered the 2026-04-13 corruption.
+    fires.push(svc.append(makeInput({ entity_id: "arm-large-1", payload: largePayload })));
+    fires.push(svc.append(makeInput({ entity_id: "policy-1", payload: smallPayload })));
+    fires.push(svc.append(makeInput({ entity_id: "arm-large-2", payload: largePayload })));
+    fires.push(svc.append(makeInput({ entity_id: "policy-2", payload: smallPayload })));
+    fires.push(svc.append(makeInput({ entity_id: "arm-large-3", payload: largePayload })));
+
+    const envelopes = await Promise.all(fires);
+    expect(envelopes).toHaveLength(5);
+
+    // The on-disk file MUST have exactly 5 lines, each parseable.
+    const raw = readFileSync(logPath, "utf8");
+    const lines = raw.split("\n").filter((l) => l.length > 0);
+    expect(lines).toHaveLength(5);
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      let parsed: unknown;
+      expect(() => {
+        parsed = JSON.parse(line);
+      }).not.toThrow();
+      expect(parsed).toMatchObject({ entity_id: expect.any(String) });
+    }
+
+    // Cross-check: the entity_ids seen on disk must be exactly the five
+    // we appended (no duplicates, no fragments).
+    const seenIds = lines.map((l) => (JSON.parse(l) as EventEnvelope).entity_id).toSorted();
+    expect(seenIds).toEqual(["arm-large-1", "arm-large-2", "arm-large-3", "policy-1", "policy-2"]);
+  });
+
+  it("failed append does not poison writeChain for subsequent writes", async () => {
+    // If one append throws (e.g. schema validation fails), the chain must
+    // not starve — the next valid append should still succeed.
+    const bad = makeInput() as Partial<AppendInput>;
+    delete bad.actor;
+
+    await expect(svc.append(bad as AppendInput)).rejects.toThrow(/actor/);
+
+    const good = await svc.append(makeInput({ entity_id: "after-failure" }));
+    expect(good.entity_id).toBe("after-failure");
+
+    const raw = readFileSync(logPath, "utf8");
+    const lines = raw.split("\n").filter((l) => l.length > 0);
+    expect(lines).toHaveLength(1);
+    const parsed = JSON.parse(lines[0]) as EventEnvelope;
+    expect(parsed.entity_id).toBe("after-failure");
+  });
 });
