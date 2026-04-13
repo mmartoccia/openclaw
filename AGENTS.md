@@ -100,6 +100,7 @@
 - `docs/AGENTS.md` owns Mintlify docs, docs links, and docs i18n rules.
 - `ui/AGENTS.md` owns Control UI i18n and generated locale rules.
 - `scripts/AGENTS.md` owns script-runner, local-check lock, and test/lint wrapper rules.
+- `docs/octopus-orchestrator/MEET-BRIDGE-CONTRACT.md` is the **frozen contract** for agent teleconference (`openclaw meet` verbs). **Read this BEFORE doing any agent-to-agent comms work.** Key invariants: meeting state lives in `~/.openclaw/meetings/{pending,active,closed}/` as file moves (never edits); `openclaw meet send` is the ONLY legitimate primitive for a meeting turn; raw `openclaw agent --to X --deliver` is forbidden for relay because it runs an agent turn with its own output, not a literal relay; `openclaw message send` is literal-text relay; per-agent speaker icons (claude-code=🦾, openclaw-main=🦀, meet-doctor=🩺) make attribution unambiguous; when comms feel off run `openclaw meet doctor --channel telegram --target <chat_id>` for an end-to-end smoke test. The 2026-04-12 drift cost hours of debugging; do not re-derive — read the contract.
 
 ## exe.dev VM ops (general)
 
