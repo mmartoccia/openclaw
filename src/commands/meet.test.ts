@@ -10,8 +10,10 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  clearCurrentInteractiveMeeting,
   defaultMeetDeps,
   dialMeeting,
+  getCurrentInteractiveMeeting,
   inviteGuest,
   listMeetings,
   loadGuestRegistry,
@@ -19,6 +21,7 @@ import {
   resolveGuestTimeoutSec,
   renderTranscript,
   sendTurn,
+  setCurrentInteractiveMeeting,
   showMeeting,
   wrapMeeting,
   type MeetDeps,
@@ -1144,5 +1147,192 @@ describe("inviteGuest — openclaw_agent adapter", () => {
     const transcript = meetings[0].transcript ?? [];
     expect(transcript.length).toBe(1);
     expect(transcript[0].body).toContain("[ERROR]");
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// MeetingFile.origin field
+// ──────────────────────────────────────────────────────────────────────────
+//
+// Hard distinguisher between dial-style and ephemeral-invite meetings.
+// Routers (and operators eyeballing the meeting json) need to tell these
+// apart without parsing the context string. Added 2026-04-14 after
+// openclaw-main was observed routing user-intended conversation through
+// ephemeral invites and confusing the operator who was checking pending/.
+
+describe("MeetingFile.origin", () => {
+  it("dialMeeting stamps origin: 'dial'", () => {
+    const result = dialMeeting(deps, {
+      to: "claude-code",
+      topic: "test",
+      from: "openclaw-main",
+      fromChannel: "telegram",
+      fromChat: "1234",
+    });
+    expect(result.meeting.origin).toBe("dial");
+    // Re-read from disk to verify the value persists.
+    const onDisk = JSON.parse(readFileSync(result.path, "utf8")) as MeetingFile;
+    expect(onDisk.origin).toBe("dial");
+  });
+
+  it("ephemeral invite stamps origin: 'ephemeral'", async () => {
+    writeGuestRegistry(tmp, cliGuestYaml(tmp, "ok"));
+    await inviteGuest(deps, {
+      from: "openclaw-main",
+      guest: "test-cli",
+      prompt: "hi",
+      create: true,
+      topic: "ephemeral test",
+      replyVia: "telegram:1234",
+    });
+    const meetings = listMeetings(deps, { state: "active" });
+    expect(meetings.length).toBe(1);
+    expect(meetings[0].origin).toBe("ephemeral");
+  });
+
+  it("origin is preserved across pickup → wrap lifecycle", async () => {
+    const dialed = dialMeeting(deps, {
+      to: "claude-code",
+      topic: "lifecycle test",
+      from: "openclaw-main",
+      fromChannel: "telegram",
+      fromChat: "1234",
+    });
+    pickupMeeting(deps, { meeting: dialed.meeting.meeting_id, pickedUpBy: "claude-code" });
+    await wrapMeeting(deps, { meeting: dialed.meeting.meeting_id, silent: true });
+
+    const closed = listMeetings(deps, { state: "closed" });
+    expect(closed.length).toBe(1);
+    expect(closed[0].origin).toBe("dial");
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// Current-interactive meeting pointer
+// ──────────────────────────────────────────────────────────────────────────
+//
+// State file at `~/.openclaw/meetings/current-interactive.json` that lets
+// routers know which meeting is the "current interactive conversation"
+// and prefer `meet send` to that meeting over `meet invite --create`.
+
+describe("current interactive meeting pointer", () => {
+  it("returns null when no pointer exists", () => {
+    expect(getCurrentInteractiveMeeting(deps)).toBeNull();
+  });
+
+  it("setCurrentInteractiveMeeting writes a pointer for an existing meeting", () => {
+    const dialed = dialMeeting(deps, {
+      to: "claude-code",
+      topic: "anchor",
+      from: "user",
+      fromChannel: "cli",
+      fromChat: "",
+    });
+    const ptr = setCurrentInteractiveMeeting(deps, dialed.meeting.meeting_id, "user");
+    expect(ptr.meeting_id).toBe(dialed.meeting.meeting_id);
+    expect(ptr.set_by).toBe("user");
+    expect(ptr.set_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+
+    const round = getCurrentInteractiveMeeting(deps);
+    expect(round?.meeting_id).toBe(dialed.meeting.meeting_id);
+  });
+
+  it("setCurrentInteractiveMeeting throws if the meeting does not exist", () => {
+    expect(() => setCurrentInteractiveMeeting(deps, "mtg_does_not_exist")).toThrow(/not found/);
+  });
+
+  it("setCurrentInteractiveMeeting overwrites a prior pointer (idempotent)", () => {
+    const a = dialMeeting(deps, {
+      to: "claude-code",
+      topic: "first",
+      from: "user",
+      fromChannel: "cli",
+      fromChat: "",
+    });
+    const b = dialMeeting(deps, {
+      to: "claude-code",
+      topic: "second",
+      from: "user",
+      fromChannel: "cli",
+      fromChat: "",
+    });
+    setCurrentInteractiveMeeting(deps, a.meeting.meeting_id);
+    setCurrentInteractiveMeeting(deps, b.meeting.meeting_id);
+    expect(getCurrentInteractiveMeeting(deps)?.meeting_id).toBe(b.meeting.meeting_id);
+  });
+
+  it("clearCurrentInteractiveMeeting removes the pointer and is idempotent", () => {
+    const dialed = dialMeeting(deps, {
+      to: "claude-code",
+      topic: "clearable",
+      from: "user",
+      fromChannel: "cli",
+      fromChat: "",
+    });
+    setCurrentInteractiveMeeting(deps, dialed.meeting.meeting_id);
+
+    expect(clearCurrentInteractiveMeeting(deps)).toBe(true);
+    expect(getCurrentInteractiveMeeting(deps)).toBeNull();
+    // Idempotent — second clear is a no-op that returns false.
+    expect(clearCurrentInteractiveMeeting(deps)).toBe(false);
+  });
+
+  it("wrapMeeting auto-clears the pointer when wrapping the pointed-at meeting", async () => {
+    const dialed = dialMeeting(deps, {
+      to: "claude-code",
+      topic: "auto-clear test",
+      from: "user",
+      fromChannel: "cli",
+      fromChat: "",
+    });
+    pickupMeeting(deps, { meeting: dialed.meeting.meeting_id });
+    setCurrentInteractiveMeeting(deps, dialed.meeting.meeting_id);
+
+    expect(getCurrentInteractiveMeeting(deps)?.meeting_id).toBe(dialed.meeting.meeting_id);
+
+    await wrapMeeting(deps, { meeting: dialed.meeting.meeting_id, silent: true });
+
+    expect(getCurrentInteractiveMeeting(deps)).toBeNull();
+  });
+
+  it("wrapMeeting does NOT clear the pointer when wrapping an unrelated meeting", async () => {
+    const anchor = dialMeeting(deps, {
+      to: "claude-code",
+      topic: "anchor",
+      from: "user",
+      fromChannel: "cli",
+      fromChat: "",
+    });
+    const other = dialMeeting(deps, {
+      to: "claude-code",
+      topic: "other",
+      from: "user",
+      fromChannel: "cli",
+      fromChat: "",
+    });
+    pickupMeeting(deps, { meeting: anchor.meeting.meeting_id });
+    pickupMeeting(deps, { meeting: other.meeting.meeting_id });
+    setCurrentInteractiveMeeting(deps, anchor.meeting.meeting_id);
+
+    await wrapMeeting(deps, { meeting: other.meeting.meeting_id, silent: true });
+
+    // Pointer to anchor must still exist after wrapping `other`.
+    const remaining = getCurrentInteractiveMeeting(deps);
+    expect(remaining?.meeting_id).toBe(anchor.meeting.meeting_id);
+  });
+
+  it("getCurrentInteractiveMeeting tolerates malformed JSON and returns null", () => {
+    // Manually corrupt the pointer file with junk.
+    const ptrPath = path.join(tmp, ".openclaw", "meetings", "current-interactive.json");
+    mkdirSync(path.dirname(ptrPath), { recursive: true });
+    writeFileSync(ptrPath, "not json at all{{");
+    expect(getCurrentInteractiveMeeting(deps)).toBeNull();
+  });
+
+  it("getCurrentInteractiveMeeting returns null when meeting_id is missing", () => {
+    const ptrPath = path.join(tmp, ".openclaw", "meetings", "current-interactive.json");
+    mkdirSync(path.dirname(ptrPath), { recursive: true });
+    writeFileSync(ptrPath, JSON.stringify({ set_at: "2026-04-14T12:00:00Z" }));
+    expect(getCurrentInteractiveMeeting(deps)).toBeNull();
   });
 });

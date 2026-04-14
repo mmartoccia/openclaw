@@ -10,15 +10,18 @@
 
 import type { Command } from "commander";
 import {
+  clearCurrentInteractiveMeeting,
   defaultMeetDeps,
   dialMeeting,
   doctorMeet,
   formatDoctorResult,
+  getCurrentInteractiveMeeting,
   inviteGuest,
   listMeetings,
   pickupMeeting,
   renderTranscript,
   sendTurn,
+  setCurrentInteractiveMeeting,
   showMeeting,
   wrapMeeting,
   type MeetDeps,
@@ -359,6 +362,76 @@ ${formatHelpExamples([
     .action((opts) => {
       const meeting = showMeeting(deps, String(opts.meeting));
       emit(renderTranscript(meeting), false);
+    });
+
+  // ── current ──────────────────────────────────────────────────────────
+  //
+  // Read or write the "current interactive meeting" pointer at
+  // ~/.openclaw/meetings/current-interactive.json. Routers like
+  // openclaw-main's meet-dial wrapper use this to discover where to
+  // `meet send` instead of falling back to `meet invite --create`,
+  // which spawns a context-less ephemeral guest subprocess.
+  //
+  // No flags → print current pointer (or "(none)").
+  // --set <id> → write the pointer (validates the meeting exists).
+  // --clear → remove the pointer.
+  meet
+    .command("current")
+    .description(
+      "Read or write the current interactive meeting pointer (used by routers to prefer `meet send`)",
+    )
+    .option("--set <id>", "Set the pointer to this meeting id")
+    .option("--clear", "Remove the pointer", false)
+    .option("--json", "Output JSON instead of human-readable", false)
+    .action((opts) => {
+      const setId = stringOrUndef(opts.set);
+      const wantClear = Boolean(opts.clear);
+      if (setId && wantClear) {
+        process.stderr.write("meet current: --set and --clear are mutually exclusive\n");
+        process.exit(2);
+      }
+      if (setId) {
+        const ptr = setCurrentInteractiveMeeting(deps, setId);
+        if (opts.json) {
+          emit(ptr, true);
+        } else {
+          emit(
+            [
+              `set:        ${ptr.meeting_id}`,
+              `set_at:     ${ptr.set_at}`,
+              ...(ptr.set_by ? [`set_by:     ${ptr.set_by}`] : []),
+            ].join("\n"),
+            false,
+          );
+        }
+        return;
+      }
+      if (wantClear) {
+        const removed = clearCurrentInteractiveMeeting(deps);
+        if (opts.json) {
+          emit({ cleared: removed }, true);
+        } else {
+          emit(removed ? "cleared" : "(no pointer to clear)", false);
+        }
+        return;
+      }
+      const ptr = getCurrentInteractiveMeeting(deps);
+      if (opts.json) {
+        emit(ptr, true);
+        return;
+      }
+      if (!ptr) {
+        emit("(no current interactive meeting)", false);
+        process.exit(1);
+      }
+      emit(
+        [
+          `meeting_id: ${ptr.meeting_id}`,
+          `set_at:     ${ptr.set_at}`,
+          ...(ptr.set_by ? [`set_by:     ${ptr.set_by}`] : []),
+        ].join("\n"),
+        false,
+      );
     });
 
   // ── doctor ───────────────────────────────────────────────────────────

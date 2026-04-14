@@ -38,6 +38,7 @@ import {
   readFileSync,
   readdirSync,
   renameSync,
+  rmSync,
   writeFileSync,
 } from "node:fs";
 import { homedir as osHomedir } from "node:os";
@@ -78,6 +79,18 @@ export interface MeetingFile {
   outcome?: string;
   turns?: number;
   /**
+   * Optional: how the meeting was originally created. Lets tooling
+   * distinguish a normal interactive `dial` (writes pending/, waits for
+   * pickup) from an `ephemeral` invite (skips pending/, picked up by
+   * the inviter inline for a one-shot guest subprocess turn). Added
+   * 2026-04-14 after openclaw-main was observed routing user-intended
+   * conversation through ephemeral invites and confusing operators
+   * scanning their pending inbox. Unset on legacy meetings created
+   * before this field existed — readers should treat absence as
+   * "unknown / dial-style." Never overwritten after creation.
+   */
+  origin?: MeetingOrigin;
+  /**
    * Append-only turn log captured inside the meeting file itself. Each
    * entry is one `send` call: who spoke, when, to whom, the message
    * body, and optionally the reply. Used by `transcript` and by future
@@ -85,6 +98,19 @@ export interface MeetingFile {
    */
   transcript?: MeetingTurn[];
 }
+
+/**
+ * Where this meeting came from. Used as a hard distinguisher between
+ * the patterns the meet bridge supports:
+ *
+ * - `dial`: interactive request, written to pending/, waits for
+ *   pickup by a watcher / human / remote agent. Default when the
+ *   field is unset or the meeting was created before 2026-04-14.
+ * - `ephemeral`: created inline by `meet invite --create` to host a
+ *   one-shot guest subprocess turn. Picked up by the inviter
+ *   automatically, never sees pending/.
+ */
+export type MeetingOrigin = "dial" | "ephemeral";
 
 export interface MeetingTurn {
   ts: string;
@@ -177,6 +203,112 @@ function ensureDirs(deps: MeetDeps): void {
   for (const state of ["pending", "active", "closed"] as const) {
     mkdirSync(dirForState(deps, state), { recursive: true });
   }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Current-interactive meeting pointer
+// ──────────────────────────────────────────────────────────────────────────
+//
+// Routing problem (2026-04-14): when openclaw-main wants to talk to the
+// user's live claude-code session, it has no way to know which meeting
+// is the "current interactive conversation." Without that pointer it
+// either has to know the meeting id by hand (brittle — meeting ids
+// rotate, wrapped meetings move to closed/) or fall back to
+// `meet invite --create` which spawns an ephemeral guest subprocess
+// with no session context — wrong tool for the intent.
+//
+// This pointer fixes that. The interactive session writes its meeting
+// id here on start; routers (openclaw-main's meet-dial wrapper, future
+// SYSTEM.md guidance) read it to discover where to `meet send` instead
+// of guessing or invoking a fresh ephemeral guest.
+//
+// File semantics:
+// - One JSON object: `{ meeting_id, set_at, set_by? }`
+// - Stored at `<meetingsRoot>/current-interactive.json`
+// - Cleared by `meet wrap` when wrapping the pointed-at meeting
+// - Stale references (pointer survives but meeting moved to closed/)
+//   are tolerated by readers — they re-resolve via findMeetingFile and
+//   downgrade to "no current interactive" if the meeting is no longer
+//   active.
+//
+// This pointer is intentionally NOT a lock or a queue — it's just a
+// last-known-good hint so routers can avoid the wrong-pattern trap.
+
+const CURRENT_INTERACTIVE_FILENAME = "current-interactive.json";
+
+export interface CurrentInteractivePointer {
+  meeting_id: string;
+  set_at: string;
+  set_by?: string;
+}
+
+function currentInteractivePointerPath(deps: MeetDeps): string {
+  return pathJoin(meetingsRoot(deps), CURRENT_INTERACTIVE_FILENAME);
+}
+
+/**
+ * Read the current-interactive meeting pointer, returning null if the
+ * file doesn't exist or fails to parse. Does NOT verify the meeting
+ * still exists in active/ — callers that need that guarantee should
+ * follow up with `findMeetingFile`.
+ */
+export function getCurrentInteractiveMeeting(deps: MeetDeps): CurrentInteractivePointer | null {
+  const path = currentInteractivePointerPath(deps);
+  if (!existsSync(path)) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<CurrentInteractivePointer>;
+    if (typeof parsed.meeting_id !== "string" || parsed.meeting_id.length === 0) {
+      return null;
+    }
+    return {
+      meeting_id: parsed.meeting_id,
+      set_at: typeof parsed.set_at === "string" ? parsed.set_at : isoTimestamp(deps),
+      set_by: typeof parsed.set_by === "string" ? parsed.set_by : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Write the current-interactive meeting pointer. Idempotent — overwrites
+ * any prior pointer. Validates that `meetingId` actually exists in
+ * pending/active/closed, but does NOT require it to be in active/ (a
+ * caller that wants strict-active should check before calling).
+ */
+export function setCurrentInteractiveMeeting(
+  deps: MeetDeps,
+  meetingId: string,
+  setBy?: string,
+): CurrentInteractivePointer {
+  ensureDirs(deps);
+  const found = findMeetingFile(deps, meetingId);
+  if (!found) {
+    throw new Error(`meet current --set: meeting not found: ${meetingId}`);
+  }
+  const pointer: CurrentInteractivePointer = {
+    meeting_id: meetingId,
+    set_at: isoTimestamp(deps),
+    set_by: setBy ?? deps.env().OPENCLAW_AGENT_ID ?? undefined,
+  };
+  writeFileSync(currentInteractivePointerPath(deps), `${JSON.stringify(pointer, null, 2)}\n`);
+  return pointer;
+}
+
+/**
+ * Remove the current-interactive pointer. Idempotent — no-op if the
+ * file doesn't exist. Returns true if the pointer was actually deleted,
+ * false if it was already absent.
+ */
+export function clearCurrentInteractiveMeeting(deps: MeetDeps): boolean {
+  const path = currentInteractivePointerPath(deps);
+  if (!existsSync(path)) {
+    return false;
+  }
+  rmSync(path, { force: true });
+  return true;
 }
 
 function isoTimestamp(deps: MeetDeps): string {
@@ -358,6 +490,7 @@ export function dialMeeting(deps: MeetDeps, opts: DialOptions): DialResult {
     reply_via: replyVia,
     created_at: isoTimestamp(deps),
     status: "pending",
+    origin: "dial",
   };
 
   const path = pathJoin(dirForState(deps, "pending"), `${meeting.meeting_id}.json`);
@@ -703,6 +836,18 @@ export async function wrapMeeting(deps: MeetDeps, opts: WrapOptions): Promise<Wr
   }
 
   const newPath = moveMeeting(deps, meeting.meeting_id, found.path, "closed");
+
+  // If the meeting being wrapped is the current interactive pointer
+  // target, clear the pointer so the next outreach from openclaw-main
+  // (or any other router) doesn't try to `meet send` into a meeting
+  // that's now in closed/. The router can then fall back to creating a
+  // fresh interactive meeting via dial OR using ephemeral invite.
+  // Idempotent — silent no-op if no pointer or pointer is unrelated.
+  const pointer = getCurrentInteractiveMeeting(deps);
+  if (pointer && pointer.meeting_id === meeting.meeting_id) {
+    clearCurrentInteractiveMeeting(deps);
+  }
+
   return { meeting, path: newPath };
 }
 
@@ -1434,6 +1579,7 @@ function createEphemeralMeeting(
     status: "active",
     started_at: isoTimestamp(deps),
     picked_up_by: hostAgent,
+    origin: "ephemeral",
     transcript: [],
   };
   const activePath = pathJoin(dirForState(deps, "active"), `${meeting.meeting_id}.json`);
