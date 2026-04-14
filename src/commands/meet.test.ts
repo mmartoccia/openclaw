@@ -1336,3 +1336,177 @@ describe("current interactive meeting pointer", () => {
     expect(getCurrentInteractiveMeeting(deps)).toBeNull();
   });
 });
+
+// ──────────────────────────────────────────────────────────────────────────
+// inviteGuest routing intercept
+// ──────────────────────────────────────────────────────────────────────────
+//
+// Phase 2 of the 2026-04-14 routing fix. The meet-dial.sh wrapper alone
+// wasn't enough because openclaw-main calls `openclaw meet invite --create`
+// directly via its tool surface, bypassing the wrapper. The intercept
+// lives inside inviteGuest() itself — the only choke point the gateway
+// tool call has to traverse.
+
+describe("inviteGuest current-interactive routing intercept", () => {
+  beforeEach(() => {
+    writeGuestRegistry(tmp, cliGuestYaml(tmp, "subprocess output that should NOT be returned"));
+  });
+
+  it("intercepts --create when pointer matches and routes via sendTurn", async () => {
+    // Set up a long-running interactive meeting that the intercept
+    // should route into.
+    const anchor = dialMeeting(deps, {
+      to: "test-cli",
+      topic: "long-running interactive",
+      from: "user",
+      fromChannel: "telegram",
+      fromChat: "1234",
+    });
+    pickupMeeting(deps, { meeting: anchor.meeting.meeting_id, pickedUpBy: "test-cli" });
+    setCurrentInteractiveMeeting(deps, anchor.meeting.meeting_id);
+
+    // openclaw-main attempts to invite test-cli via --create. This
+    // SHOULD be intercepted and routed to the anchor meeting.
+    const result = await inviteGuest(deps, {
+      from: "openclaw-main",
+      guest: "test-cli",
+      prompt: "hey test-cli, what do you think about X?",
+      create: true,
+      topic: "would-have-been-ephemeral",
+      replyVia: "telegram:1234",
+    });
+
+    // The response must point at the anchor meeting, not a fresh one.
+    expect(result.meeting_id).toBe(anchor.meeting.meeting_id);
+    expect(result.ephemeral).toBe(false);
+    expect(result.response_text).toContain("intercepted by current-interactive routing");
+    expect(result.response_text).toContain(anchor.meeting.meeting_id);
+
+    // No new meeting should have been created in active/ — the only
+    // active meeting is still the anchor.
+    const active = listMeetings(deps, { state: "active" });
+    expect(active.length).toBe(1);
+    expect(active[0].meeting_id).toBe(anchor.meeting.meeting_id);
+
+    // The anchor meeting's transcript should now contain the routed
+    // turn (sendTurn appends it).
+    const updated = active[0];
+    expect(updated.transcript?.length ?? 0).toBeGreaterThanOrEqual(1);
+    const lastTurn = updated.transcript?.[updated.transcript.length - 1];
+    expect(lastTurn?.from).toBe("openclaw-main");
+    expect(lastTurn?.body).toContain("hey test-cli");
+
+    // The subprocess that the cliGuestYaml stubbed must NOT have run —
+    // the intercept short-circuits before the guest adapter dispatch.
+    expect(result.response_text).not.toContain("subprocess output that should NOT be returned");
+  });
+
+  it("does NOT intercept when no pointer is set", async () => {
+    // No setCurrentInteractiveMeeting call — pointer is absent.
+    const result = await inviteGuest(deps, {
+      from: "openclaw-main",
+      guest: "test-cli",
+      prompt: "anything",
+      create: true,
+      topic: "should be ephemeral",
+      replyVia: "telegram:1234",
+    });
+
+    expect(result.ephemeral).toBe(true);
+    expect(result.response_text).not.toContain("intercepted");
+    // A NEW ephemeral meeting must have been created.
+    const active = listMeetings(deps, { state: "active" });
+    expect(active.length).toBe(1);
+    expect(active[0].origin).toBe("ephemeral");
+  });
+
+  it("does NOT intercept when pointer's to_agent does not match the guest", async () => {
+    // Anchor is for codex, but the invite asks for test-cli. Mismatch
+    // → no intercept, ephemeral path runs as designed.
+    const anchor = dialMeeting(deps, {
+      to: "codex",
+      topic: "codex chat",
+      from: "user",
+      fromChannel: "telegram",
+      fromChat: "1234",
+    });
+    pickupMeeting(deps, { meeting: anchor.meeting.meeting_id, pickedUpBy: "codex" });
+    setCurrentInteractiveMeeting(deps, anchor.meeting.meeting_id);
+
+    const result = await inviteGuest(deps, {
+      from: "openclaw-main",
+      guest: "test-cli",
+      prompt: "anything",
+      create: true,
+      topic: "ephemeral please",
+      replyVia: "telegram:1234",
+    });
+
+    expect(result.ephemeral).toBe(true);
+    // Two active meetings now: the codex anchor and the new ephemeral.
+    const active = listMeetings(deps, { state: "active" });
+    expect(active.length).toBe(2);
+  });
+
+  it("does NOT intercept when pointer references a closed/wrapped meeting", async () => {
+    const anchor = dialMeeting(deps, {
+      to: "test-cli",
+      topic: "wrapped meeting",
+      from: "user",
+      fromChannel: "telegram",
+      fromChat: "1234",
+    });
+    pickupMeeting(deps, { meeting: anchor.meeting.meeting_id, pickedUpBy: "test-cli" });
+    setCurrentInteractiveMeeting(deps, anchor.meeting.meeting_id);
+    // Wrap it — auto-clear should fire and remove the pointer.
+    await wrapMeeting(deps, { meeting: anchor.meeting.meeting_id, silent: true });
+    expect(getCurrentInteractiveMeeting(deps)).toBeNull();
+
+    // The intercept should not fire because the pointer is gone.
+    const result = await inviteGuest(deps, {
+      from: "openclaw-main",
+      guest: "test-cli",
+      prompt: "anything",
+      create: true,
+      topic: "fresh ephemeral",
+      replyVia: "telegram:1234",
+    });
+    expect(result.ephemeral).toBe(true);
+  });
+
+  it("does NOT intercept on non-create invite (existing-meeting path)", async () => {
+    // The intercept only applies to --create. If openclaw-main
+    // explicitly targets a meeting via --meeting, leave it alone.
+    const anchor = dialMeeting(deps, {
+      to: "test-cli",
+      topic: "anchor",
+      from: "user",
+      fromChannel: "telegram",
+      fromChat: "1234",
+    });
+    pickupMeeting(deps, { meeting: anchor.meeting.meeting_id, pickedUpBy: "test-cli" });
+    setCurrentInteractiveMeeting(deps, anchor.meeting.meeting_id);
+
+    const target = dialMeeting(deps, {
+      to: "test-cli",
+      topic: "target",
+      from: "user",
+      fromChannel: "telegram",
+      fromChat: "1234",
+    });
+    pickupMeeting(deps, { meeting: target.meeting.meeting_id, pickedUpBy: "test-cli" });
+
+    // Invite into target meeting explicitly. Pointer points to anchor,
+    // not target. Intercept should NOT fire because create is false.
+    const result = await inviteGuest(deps, {
+      from: "openclaw-main",
+      guest: "test-cli",
+      prompt: "anything",
+      meeting: target.meeting.meeting_id,
+    });
+    // Whatever response_text we got must not be the routing stub —
+    // it should be the subprocess output (cliGuestYaml stub).
+    expect(result.response_text).not.toContain("intercepted by current-interactive routing");
+    expect(result.meeting_id).toBe(target.meeting.meeting_id);
+  });
+});

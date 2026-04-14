@@ -1613,6 +1613,71 @@ export async function inviteGuest(deps: MeetDeps, opts: InviteOptions): Promise<
     throw new Error("meet invite: no host identity — pass --from or set OPENCLAW_AGENT_ID in env");
   }
 
+  // ── 1.5. Routing intercept: prefer the current interactive meeting ──
+  //
+  // 2026-04-14 fix for the "openclaw-main spawns ephemeral guests
+  // instead of talking to the live interactive Claude Code session"
+  // bug. The original meet-dial.sh wrapper fix was bypassed because
+  // openclaw-main calls `openclaw meet invite --create --guest X`
+  // directly via its tool surface, never going through the wrapper.
+  // This intercept catches the bypass at the function level — the
+  // only choke point the gateway tool call has to traverse.
+  //
+  // Intercept rules:
+  //   - Only fires when `opts.create` is true (the ephemeral path).
+  //     Existing-meeting invites are pass-through; the caller has
+  //     already chosen a target meeting.
+  //   - The current-interactive pointer must exist.
+  //   - The pointed-at meeting must be in `active/` (stale pointers
+  //     fall through to the normal ephemeral path so the operator
+  //     isn't blocked by an out-of-date pointer).
+  //   - The pointed-at meeting's `to_agent` must equal `opts.guest`.
+  //     If openclaw-main is asking for a different guest (codex,
+  //     gemini, etc.) the pointer doesn't match and we use the
+  //     ephemeral path as designed.
+  //
+  // When the intercept fires, we route the prompt through `sendTurn`
+  // into the existing interactive meeting and return a routing-stub
+  // InviteResult so the caller (openclaw-main) gets a clear signal
+  // that the routing happened and there is no synchronous subprocess
+  // response_text to relay — the human's interactive Claude Code
+  // session will respond organically in the next chat turn.
+  if (opts.create) {
+    const pointer = getCurrentInteractiveMeeting(deps);
+    if (pointer) {
+      const found = findMeetingFile(deps, pointer.meeting_id);
+      if (found && found.state === "active") {
+        const pointed = readMeeting(found.path);
+        if (pointed.to_agent === opts.guest) {
+          // Match — route via sendTurn instead of creating an ephemeral.
+          // Use the prompt verbatim; the existing meeting already has
+          // its own context, so we don't need the buildGuestContext
+          // wrapping that ephemeral invites use.
+          const sendResult = await sendTurn(deps, {
+            meeting: pointed.meeting_id,
+            message: opts.prompt,
+            from: hostAgent,
+          });
+          return {
+            meeting_id: pointed.meeting_id,
+            guest: opts.guest,
+            // Stub response — the actual reply will arrive
+            // asynchronously in the next turn from the interactive
+            // session. Make it human-readable so openclaw-main
+            // doesn't claim to know what claude-code "said."
+            response_text:
+              `[meet invite intercepted by current-interactive routing — sent to ${pointed.meeting_id} ` +
+              `(${pointed.topic}) via meet send. The human's interactive Claude Code session will respond ` +
+              `directly in the chat. Do not relay or paraphrase any "response_text" — there is none yet.]`,
+            latency_ms: 0,
+            frame_delivered: sendResult.deliveredText.length > 0,
+            ephemeral: false,
+          };
+        }
+      }
+    }
+  }
+
   // 2. Load or create meeting
   let meeting: MeetingFile;
   let meetingPath: string;
