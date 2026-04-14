@@ -1649,28 +1649,83 @@ export async function inviteGuest(deps: MeetDeps, opts: InviteOptions): Promise<
       if (found && found.state === "active") {
         const pointed = readMeeting(found.path);
         if (pointed.to_agent === opts.guest) {
-          // Match — route via sendTurn instead of creating an ephemeral.
-          // Use the prompt verbatim; the existing meeting already has
-          // its own context, so we don't need the buildGuestContext
-          // wrapping that ephemeral invites use.
-          const sendResult = await sendTurn(deps, {
-            meeting: pointed.meeting_id,
-            message: opts.prompt,
+          // Match — route via fast body-post-only path instead of
+          // creating an ephemeral. We deliberately do NOT call
+          // sendTurn here because sendTurn runs an agent inference
+          // (`openclaw agent ... --message ...`) that takes 30-180s,
+          // which trips openclaw-main's exec-wrapper timeout (~30s)
+          // and produces SIGKILL on the calling side.
+          //
+          // Instead we do the half that's essential and fast:
+          //   1. Build the speaker frame (openclaw-main → claude-code)
+          //   2. Post it to the channel via runMessageSend (~1-2s)
+          //   3. Append the turn to the meeting transcript (no reply)
+          //   4. Return the routing stub
+          //
+          // The human's interactive Claude Code session will see the
+          // framed message in Telegram (it's already attached to the
+          // meeting's reply_via channel) and respond by running its
+          // own meet send turn back to openclaw-main. That's a separate
+          // transcript turn handled by the live session, not this code.
+          const interceptStart = Date.now();
+          const [channel, chatId] = (pointed.reply_via ?? "").split(":");
+          let frameDelivered = false;
+          if (channel && chatId) {
+            const fromIcon = agentIcon(hostAgent);
+            const toIcon = agentIcon(pointed.to_agent);
+            const framed = speakerFrame(hostAgent, pointed.to_agent, opts.prompt, fromIcon, toIcon);
+            try {
+              await deps.runMessageSend([
+                "message",
+                "send",
+                "--target",
+                chatId,
+                "--channel",
+                channel,
+                "--message",
+                framed,
+              ]);
+              frameDelivered = true;
+            } catch (err) {
+              // Best-effort post — don't fail the whole intercept on
+              // a transient channel hiccup. The transcript still gets
+              // the turn and the operator can re-send manually.
+              process.stderr.write(
+                `meet invite (routed): channel post failed (continuing): ${
+                  err instanceof Error ? err.message : String(err)
+                }\n`,
+              );
+            }
+          }
+
+          // Append the routed turn to the meeting transcript.
+          // Re-read in case anything changed between findMeetingFile
+          // above and now (concurrent meet send from another caller).
+          const fresh = readMeeting(found.path);
+          const turn: MeetingTurn = {
+            ts: isoTimestamp(deps),
             from: hostAgent,
-          });
+            to: fresh.to_agent,
+            body: opts.prompt,
+          };
+          fresh.transcript = [...(fresh.transcript ?? []), turn];
+          fresh.turns = (fresh.turns ?? 0) + 1;
+          writeMeeting(found.path, fresh);
+
           return {
             meeting_id: pointed.meeting_id,
             guest: opts.guest,
             // Stub response — the actual reply will arrive
-            // asynchronously in the next turn from the interactive
+            // asynchronously in a future turn from the interactive
             // session. Make it human-readable so openclaw-main
             // doesn't claim to know what claude-code "said."
             response_text:
-              `[meet invite intercepted by current-interactive routing — sent to ${pointed.meeting_id} ` +
-              `(${pointed.topic}) via meet send. The human's interactive Claude Code session will respond ` +
-              `directly in the chat. Do not relay or paraphrase any "response_text" — there is none yet.]`,
-            latency_ms: 0,
-            frame_delivered: sendResult.deliveredText.length > 0,
+              `[meet invite intercepted by current-interactive routing — message posted to ${pointed.meeting_id} ` +
+              `(${pointed.topic}) and delivered to ${pointed.reply_via}. The human's interactive Claude Code ` +
+              `session will see the message in the chat and respond directly. Do not relay or paraphrase any ` +
+              `"response_text" — there is none yet, and there will not be a synchronous reply on this call.]`,
+            latency_ms: Date.now() - interceptStart,
+            frame_delivered: frameDelivered,
             ephemeral: false,
           };
         }
