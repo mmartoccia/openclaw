@@ -1214,16 +1214,17 @@ export async function runHeartbeatOnce(opts: {
 
     // Record last delivered heartbeat payload for dedupe.
     if (!shouldSkipMain && normalized.text.trim()) {
-      const store = loadSessionStore(storePath);
-      const current = store[sessionKey];
-      if (current) {
+      await updateSessionStore(storePath, (store) => {
+        const current = store[sessionKey];
+        if (!current) {
+          return;
+        }
         store[sessionKey] = {
           ...current,
           lastHeartbeatText: normalized.text,
           lastHeartbeatSentAt: startedAt,
         };
-        await saveSessionStore(storePath, store);
-      }
+      });
     }
 
     emitHeartbeatEvent({
