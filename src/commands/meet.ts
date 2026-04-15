@@ -205,6 +205,23 @@ function ensureDirs(deps: MeetDeps): void {
   }
 }
 
+function parseReplyVia(replyVia: string | undefined): { channel: string; target: string } | null {
+  const value = (replyVia ?? "").trim();
+  if (!value) {
+    return null;
+  }
+  const idx = value.indexOf(":");
+  if (idx <= 0 || idx >= value.length - 1) {
+    return null;
+  }
+  const channel = value.slice(0, idx).trim();
+  const target = value.slice(idx + 1).trim();
+  if (!channel || !target) {
+    return null;
+  }
+  return { channel, target };
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // Current-interactive meeting pointer
 // ──────────────────────────────────────────────────────────────────────────
@@ -602,14 +619,16 @@ export async function sendTurn(deps: MeetDeps, opts: SendOptions): Promise<SendR
   const fromIcon = opts.fromIcon ?? agentIcon(fromAgent);
   const toIcon = opts.toIcon ?? agentIcon(listenerAgent);
 
-  // Parse reply_via (e.g., "telegram:1234567890") into channel + chat.
-  const [channel, chatId] = (meeting.reply_via ?? "").split(":");
-  if (!channel || !chatId) {
+  // Parse reply_via (e.g., "telegram:1234567890" or
+  // "telegram:-100123:topic:31") into channel + target.
+  const delivery = parseReplyVia(meeting.reply_via);
+  if (!delivery) {
     throw new Error(
       `meet send: meeting ${opts.meeting} has no usable reply_via: ` +
         `"${meeting.reply_via}". Cannot route turn.`,
     );
   }
+  const { channel, target } = delivery;
 
   const framedMessage = opts.raw
     ? opts.message
@@ -637,10 +656,10 @@ export async function sendTurn(deps: MeetDeps, opts: SendOptions): Promise<SendR
     await deps.runMessageSend([
       "message",
       "send",
-      "--target",
-      chatId,
       "--channel",
       channel,
+      "--target",
+      target,
       "--message",
       framedMessage,
     ]);
@@ -672,7 +691,7 @@ export async function sendTurn(deps: MeetDeps, opts: SendOptions): Promise<SendR
   const args = [
     "agent",
     "--to",
-    chatId,
+    target,
     "--channel",
     channel,
     "--json",
@@ -714,10 +733,10 @@ export async function sendTurn(deps: MeetDeps, opts: SendOptions): Promise<SendR
       await deps.runMessageSend([
         "message",
         "send",
-        "--target",
-        chatId,
         "--channel",
         channel,
+        "--target",
+        target,
         "--message",
         framedReply,
       ]);
@@ -813,16 +832,16 @@ export async function wrapMeeting(deps: MeetDeps, opts: WrapOptions): Promise<Wr
   writeMeeting(found.path, meeting);
 
   if (!opts.silent) {
-    const [channel, chatId] = (meeting.reply_via ?? "").split(":");
-    if (channel && chatId) {
+    const delivery = parseReplyVia(meeting.reply_via);
+    if (delivery) {
       try {
         await deps.runAgentTurn([
           "message",
           "send",
           "--channel",
-          channel,
+          delivery.channel,
           "--target",
-          chatId,
+          delivery.target,
           "--message",
           wrapFrame(meeting),
         ]);
@@ -1565,12 +1584,12 @@ function createEphemeralMeeting(
   replyVia: string,
 ): MeetingFile {
   ensureDirs(deps);
-  const [channel, chatId] = (replyVia ?? "").split(":");
+  const delivery = parseReplyVia(replyVia);
   const meeting: MeetingFile = {
     meeting_id: generateMeetingId(deps),
     from_agent: hostAgent,
-    from_channel: channel ?? "cli",
-    from_chat_id: chatId ?? "",
+    from_channel: delivery?.channel ?? "cli",
+    from_chat_id: delivery?.target ?? "",
     to_agent: guestId,
     topic,
     context: "Ephemeral meeting created for one-shot guest invite",
@@ -1668,9 +1687,9 @@ export async function inviteGuest(deps: MeetDeps, opts: InviteOptions): Promise<
           // own meet send turn back to openclaw-main. That's a separate
           // transcript turn handled by the live session, not this code.
           const interceptStart = Date.now();
-          const [channel, chatId] = (pointed.reply_via ?? "").split(":");
+          const delivery = parseReplyVia(pointed.reply_via);
           let frameDelivered = false;
-          if (channel && chatId) {
+          if (delivery) {
             const fromIcon = agentIcon(hostAgent);
             const toIcon = agentIcon(pointed.to_agent);
             const framed = speakerFrame(hostAgent, pointed.to_agent, opts.prompt, fromIcon, toIcon);
@@ -1678,10 +1697,10 @@ export async function inviteGuest(deps: MeetDeps, opts: InviteOptions): Promise<
               await deps.runMessageSend([
                 "message",
                 "send",
-                "--target",
-                chatId,
                 "--channel",
-                channel,
+                delivery.channel,
+                "--target",
+                delivery.target,
                 "--message",
                 framed,
               ]);
@@ -1780,8 +1799,8 @@ export async function inviteGuest(deps: MeetDeps, opts: InviteOptions): Promise<
 
   // Parse the communication plane
   const replyVia = opts.replyVia ?? meeting.reply_via ?? "";
-  const [channel, chatId] = replyVia.split(":");
-  const canDeliver = Boolean(channel && chatId);
+  const delivery = parseReplyVia(replyVia);
+  const canDeliver = Boolean(delivery);
 
   // 5. Post the invite frame to the channel (best-effort)
   const hostIcon = agentIcon(hostAgent);
@@ -1794,9 +1813,9 @@ export async function inviteGuest(deps: MeetDeps, opts: InviteOptions): Promise<
         "message",
         "send",
         "--channel",
-        channel,
+        delivery.channel,
         "--target",
-        chatId,
+        delivery.target,
         "--message",
         inviteFrame(hostAgent, hostIcon, opts.guest, guestIcon, opts.prompt),
       ]);
@@ -1822,9 +1841,9 @@ export async function inviteGuest(deps: MeetDeps, opts: InviteOptions): Promise<
           "message",
           "send",
           "--channel",
-          channel,
+          delivery.channel,
           "--target",
-          chatId,
+          delivery.target,
           "--message",
           guestErrorFrame(opts.guest, guestIcon, errMsg),
         ]);
@@ -1853,9 +1872,9 @@ export async function inviteGuest(deps: MeetDeps, opts: InviteOptions): Promise<
           "message",
           "send",
           "--channel",
-          channel,
+          delivery.channel,
           "--target",
-          chatId,
+          delivery.target,
           "--message",
           guestErrorFrame(opts.guest, guestIcon, errMsg),
         ]);
@@ -1881,9 +1900,9 @@ export async function inviteGuest(deps: MeetDeps, opts: InviteOptions): Promise<
         "message",
         "send",
         "--channel",
-        channel,
+        delivery.channel,
         "--target",
-        chatId,
+        delivery.target,
         "--message",
         speakerFrame(opts.guest, hostAgent, response.text, guestIcon, hostIcon),
       ]);

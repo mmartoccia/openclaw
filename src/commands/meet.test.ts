@@ -268,6 +268,30 @@ describe("sendTurn", () => {
     expect(result.meeting.transcript?.[0].reply).toBe("ok from mock");
   });
 
+  it("preserves topic-scoped telegram targets in reply_via", async () => {
+    const { meeting: dialed } = dialMeeting(deps, {
+      to: "openclaw-main",
+      topic: "t",
+      fromChannel: "telegram",
+      fromChat: "-1003719787228",
+      replyVia: "telegram:-1003719787228:topic:31",
+    });
+    pickupMeeting(deps, { meeting: dialed.meeting_id });
+    await sendTurn(deps, {
+      meeting: dialed.meeting_id,
+      message: "keep this in the work topic",
+    });
+
+    const bodySendArgs = runMessageSend.mock.calls[0][0] as string[];
+    expect(bodySendArgs[bodySendArgs.indexOf("--target") + 1]).toBe("-1003719787228:topic:31");
+
+    const agentArgs = runAgentTurn.mock.calls[0][0] as string[];
+    expect(agentArgs[agentArgs.indexOf("--to") + 1]).toBe("-1003719787228:topic:31");
+
+    const replySendArgs = runMessageSend.mock.calls[1][0] as string[];
+    expect(replySendArgs[replySendArgs.indexOf("--target") + 1]).toBe("-1003719787228:topic:31");
+  });
+
   it("--raw suppresses frame wrapping", async () => {
     const { meeting: dialed } = dialMeeting(deps, {
       to: "openclaw-main",
